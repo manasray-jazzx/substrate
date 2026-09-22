@@ -104,6 +104,20 @@ func getTrustBundle(t *testing.T, c client.Client) (*certsv1beta1.ClusterTrustBu
 	return ctb, true
 }
 
+func getTrustBundleConfigMap(t *testing.T, c client.Client) (*corev1.ConfigMap, bool) {
+	t.Helper()
+	cm := &corev1.ConfigMap{}
+	key := types.NamespacedName{Namespace: ateSystemNamespace, Name: egressMITMTrustBundleConfigMapName}
+	err := c.Get(context.Background(), key, cm)
+	if k8errors.IsNotFound(err) {
+		return nil, false
+	}
+	if err != nil {
+		t.Fatalf("get trust bundle ConfigMap: %v", err)
+	}
+	return cm, true
+}
+
 func TestEgressMITMTrustPublishesEveryRoot(t *testing.T) {
 	t.Parallel()
 	scheme := egressMITMScheme(t)
@@ -298,5 +312,47 @@ func TestEgressMITMTrustKeepsLastGoodBundleOnBadPool(t *testing.T) {
 				t.Errorf("trustBundle was rewritten from an unreadable pool:\n%s", ctb.Spec.TrustBundle)
 			}
 		})
+	}
+}
+
+func TestEgressMITMTrustPublishesConfigMapMirror(t *testing.T) {
+	t.Parallel()
+	scheme := egressMITMScheme(t)
+	secret, pool := caPoolSecret(t, "mitm", "mitm-next")
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+
+	if err := reconcilePool(t, c); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	cm, ok := getTrustBundleConfigMap(t, c)
+	if !ok {
+		t.Fatal("no trust bundle ConfigMap mirror was created")
+	}
+	if got, want := cm.Labels["podcert.ate.dev/canarying"], "live"; got != want {
+		t.Errorf("canarying label = %q, want %q", got, want)
+	}
+	if got, want := cm.Data[egressMITMTrustBundleConfigMapDataKey], rootPEM(t, pool); got != want {
+		t.Errorf("ConfigMap mirror data =\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestEgressMITMTrustDeletesConfigMapMirrorWhenPoolIsGone(t *testing.T) {
+	t.Parallel()
+	scheme := egressMITMScheme(t)
+	secret, _ := caPoolSecret(t, "mitm")
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	if err := reconcilePool(t, c); err != nil {
+		t.Fatalf("first Reconcile: %v", err)
+	}
+	if err := c.Delete(context.Background(), secret); err != nil {
+		t.Fatalf("delete pool secret: %v", err)
+	}
+
+	if err := reconcilePool(t, c); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
+	}
+	if _, ok := getTrustBundleConfigMap(t, c); ok {
+		t.Error("the trust bundle ConfigMap mirror outlived its CA pool")
 	}
 }
