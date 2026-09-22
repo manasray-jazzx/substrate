@@ -20,7 +20,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/identitycert"
+	"github.com/agent-substrate/substrate/internal/identitycert"
 	"github.com/agent-substrate/substrate/internal/localca"
 	"github.com/agent-substrate/substrate/internal/proto/podcertbrokerpb"
 	"github.com/agent-substrate/substrate/internal/substratex509"

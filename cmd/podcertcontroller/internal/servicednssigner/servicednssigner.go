@@ -19,9 +19,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/identitycert"
 	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/podcertificate"
 	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/signercontroller"
+	"github.com/agent-substrate/substrate/internal/identitycert"
 	"github.com/agent-substrate/substrate/internal/localca"
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

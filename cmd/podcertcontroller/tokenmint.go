@@ -24,8 +24,8 @@ import (
 	"log/slog"
 	"net"
 
-	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/identitycert"
 	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/tokenbroker"
+	"github.com/agent-substrate/substrate/internal/identitycert"
 	"github.com/agent-substrate/substrate/internal/localca"
 	"github.com/agent-substrate/substrate/internal/proto/podcertbrokerpb"
 	"google.golang.org/grpc"
