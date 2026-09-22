@@ -15,18 +15,15 @@
 package servicednssigner
 
 import (
-	"bytes"
 	"context"
-	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	"time"
 
+	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/identitycert"
 	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/podcertificate"
 	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/signercontroller"
 	"github.com/agent-substrate/substrate/internal/localca"
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/ptr"
@@ -57,18 +54,9 @@ func (h *Impl) SignerName() string {
 func (h *Impl) DesiredClusterTrustBundles() ([]*certsv1beta1.ClusterTrustBundle, error) {
 	name := CTBPrefix + "primary-bundle"
 
-	trustAnchors, err := h.caPool.TrustAnchors()
+	trustBundle, err := identitycert.TrustBundlePEM(h.caPool)
 	if err != nil {
-		return nil, fmt.Errorf("while retrieving CA pool trust anchors: %w", err)
-	}
-
-	wantTrustBundle := bytes.Buffer{}
-	for _, anchor := range trustAnchors {
-		block := pem.EncodeToMemory(&pem.Block{
-			Type:  "CERTIFICATE",
-			Bytes: anchor.Raw,
-		})
-		_, _ = wantTrustBundle.Write(block)
+		return nil, err
 	}
 
 	wantCTB := &certsv1beta1.ClusterTrustBundle{
@@ -80,7 +68,7 @@ func (h *Impl) DesiredClusterTrustBundles() ([]*certsv1beta1.ClusterTrustBundle,
 		},
 		Spec: certsv1beta1.ClusterTrustBundleSpec{
 			SignerName:  Name,
-			TrustBundle: wantTrustBundle.String(),
+			TrustBundle: trustBundle,
 		},
 	}
 
@@ -90,60 +78,15 @@ func (h *Impl) DesiredClusterTrustBundles() ([]*certsv1beta1.ClusterTrustBundle,
 }
 
 func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateRequest) error {
-	// TODO: Switch from live reads to indexer
-
 	// If our signer had a policy about which pods are allowed to request
 	// certificates, it would be implemented here.
-
-	svcs, err := h.kc.CoreV1().Services(pcr.ObjectMeta.Namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("while listing services: %w", err)
-	}
-
-	// TODO: Looping over every service isn't great.  Maintain an index of pod
-	// to covering services.
-
-	dnsNames := []string{}
-	for _, svc := range svcs.Items {
-		switch svc.Spec.Type {
-		case corev1.ServiceTypeClusterIP, corev1.ServiceTypeNodePort, corev1.ServiceTypeLoadBalancer:
-			// ok
-		default:
-			// This service type doesn't select pods using a label selector.
-			continue
-		}
-
-		if len(svc.Spec.Selector) == 0 {
-			continue
-		}
-
-		// Find the set of pods that the service selects.
-		matchedPods, err := h.kc.CoreV1().Pods(pcr.ObjectMeta.Namespace).List(ctx, metav1.ListOptions{
-			LabelSelector: metav1.FormatLabelSelector(&metav1.LabelSelector{MatchLabels: svc.Spec.Selector}),
-		})
-		if err != nil {
-			return fmt.Errorf("while selecting pods for service %q: %w", pcr.ObjectMeta.Namespace+"/"+svc.ObjectMeta.Name, err)
-		}
-
-		for _, matchedPod := range matchedPods.Items {
-			if matchedPod.ObjectMeta.Name == pcr.Spec.PodName && matchedPod.ObjectMeta.UID == pcr.Spec.PodUID {
-				// TODO: I'm making some assumptions about the DNS names that
-				// resolve to a given Service.  I know at least one
-				// configuration that I suspect doesn't match these assumptions
-				// --- GKE with VPC-scoped Cloud DNS [1].
-				//
-				// [1] https://cloud.google.com/kubernetes-engine/docs/how-to/cloud-dns#vpc_scope_dns
-				name := fmt.Sprintf("%s.%s.svc", svc.ObjectMeta.Name, svc.ObjectMeta.Namespace)
-				dnsNames = append(dnsNames, name)
-			}
-		}
-	}
 
 	// This is returned as a transient error to allow retries.
 	// Without this, ate-apiserver can have a servicedns cert without DNS name
 	// while the covering Service is being created, and cache it for 24 hours.
-	if len(dnsNames) == 0 {
-		return fmt.Errorf("pod %s/%s is not (yet) selected by any Service; refusing to issue a serving cert with no DNS SANs", pcr.ObjectMeta.Namespace, pcr.Spec.PodName)
+	dnsNames, err := identitycert.ServiceDNSNames(ctx, h.kc, pcr.ObjectMeta.Namespace, pcr.Spec.PodName, pcr.Spec.PodUID)
+	if err != nil {
+		return err
 	}
 
 	// TODO: Encode the OIDC issuer of the cluster into the certificate.
@@ -157,41 +100,14 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 	// check subjectPublicKey, and deny the PCR with a SuggestedKeyType
 	// condition on it.
 
-	lifetime := 24 * time.Hour
 	requestedLifetime := time.Duration(*pcr.Spec.MaxExpirationSeconds) * time.Second
-	if requestedLifetime < lifetime {
-		lifetime = requestedLifetime
-	}
+	notBefore, notAfter, beginRefreshAt := identitycert.Validity(requestedLifetime)
 
-	notBefore := time.Now().Add(-2 * time.Minute)
-	notAfter := notBefore.Add(lifetime)
-	beginRefreshAt := notAfter.Add(-30 * time.Minute)
+	template := identitycert.ServiceDNSTemplate(dnsNames, notBefore, notAfter)
 
-	template := &x509.Certificate{
-		BasicConstraintsValid: true,
-		NotBefore:             notBefore,
-		NotAfter:              notAfter,
-		DNSNames:              dnsNames,
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
-		// AuthorityKeyID is automatically set to the SubjectKeyID of the parent
-		// certificate.
-	}
-
-	chainDER, err := h.caPool.CreateCertificate(template, subjectPublicKey)
+	chainPEM, err := identitycert.SignAndEncode(h.caPool, template, subjectPublicKey)
 	if err != nil {
-		return fmt.Errorf("while signing certificate: %w", err)
-	}
-
-	chainPEM := &bytes.Buffer{}
-	for _, certDER := range chainDER {
-		err = pem.Encode(chainPEM, &pem.Block{
-			Type:  "CERTIFICATE",
-			Bytes: certDER,
-		})
-		if err != nil {
-			return fmt.Errorf("while encoding certificate to PEM: %w", err)
-		}
+		return err
 	}
 
 	pcr = pcr.DeepCopy()
@@ -204,7 +120,7 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 			LastTransitionTime: metav1.NewTime(time.Now()),
 		},
 	}
-	pcr.Status.CertificateChain = chainPEM.String()
+	pcr.Status.CertificateChain = chainPEM
 	pcr.Status.NotBefore = ptr.To(metav1.NewTime(notBefore))
 	pcr.Status.BeginRefreshAt = ptr.To(metav1.NewTime(beginRefreshAt))
 	pcr.Status.NotAfter = ptr.To(metav1.NewTime(notAfter))
