@@ -80,6 +80,34 @@ var (
 		"Number of concurrent worker goroutines per signer.",
 	)
 
+	enablePCRSigning = pflag.Bool(
+		"enable-pcr-signing",
+		true,
+		"Watch and sign PodCertificateRequests. Disable on a cluster where that Kubernetes API is unavailable (e.g. its feature gates are not exposed by a managed control plane); trust-bundle publishing runs independently of this and is unaffected.",
+	)
+
+	trustBundleConfigMapNamespace = pflag.String(
+		"trust-bundle-configmap-namespace",
+		"",
+		"If set, also mirror each signer's trust bundle into a ConfigMap of the same name in this namespace, for clusters where ClusterTrustBundle is unavailable. Empty disables the mirror.",
+	)
+
+	tokenMintListenAddress = pflag.String(
+		"token-mint-listen-address",
+		"",
+		"If set, serve the TokenReview-authenticated PodCertificateBroker RPC on this address (host:port), for clusters where PodCertificateRequest is unavailable. Empty disables it.",
+	)
+	tokenMintAudience = pflag.String(
+		"token-mint-audience",
+		"podcertcontroller.ate.dev",
+		"Audience a bound ServiceAccount token must carry to authenticate to the PodCertificateBroker RPC.",
+	)
+	tokenMintServingDNSName = pflag.String(
+		"token-mint-serving-dns-name",
+		"",
+		"DNS name for the PodCertificateBroker RPC's own serving certificate (its Service's cluster DNS name). Required when --token-mint-listen-address is set.",
+	)
+
 	kubeAPIQPS = pflag.Float32(
 		"kube-api-qps",
 		0,
@@ -156,8 +184,11 @@ func main() {
 		slog.ErrorContext(ctx, "Error loading servicedns.ate.dev/identity CA pool state", slog.Any("err", err))
 		os.Exit(1)
 	}
-	serviceDNSSignerController := signercontroller.New(clock.RealClock{}, servicednssigner.NewImpl(kc, serviceDNSCAPool), kc, hasher)
-	go serviceDNSSignerController.Run(ctx, *workersPerSigner)
+	serviceDNSSignerController := signercontroller.New(clock.RealClock{}, servicednssigner.NewImpl(kc, serviceDNSCAPool), kc, hasher, *trustBundleConfigMapNamespace)
+	go serviceDNSSignerController.RunTrustBundlePublisher(ctx)
+	if *enablePCRSigning {
+		go serviceDNSSignerController.Run(ctx, *workersPerSigner)
+	}
 
 	// Create a signer for podidentity.podcert.ate.dev/identity
 	podIdentityCAPool, err := localca.NewRefreshingPool(*podCAPoolFile)
@@ -165,8 +196,22 @@ func main() {
 		slog.ErrorContext(ctx, "Error loading podidentity.podcert.ate.dev/identity CA pool state", slog.Any("err", err))
 		os.Exit(1)
 	}
-	podIdentitySignerController := signercontroller.New(clock.RealClock{}, podidentitysigner.NewImpl(kc, podIdentityCAPool), kc, hasher)
-	go podIdentitySignerController.Run(ctx, *workersPerSigner)
+	podIdentitySignerController := signercontroller.New(clock.RealClock{}, podidentitysigner.NewImpl(kc, podIdentityCAPool), kc, hasher, *trustBundleConfigMapNamespace)
+	go podIdentitySignerController.RunTrustBundlePublisher(ctx)
+	if *enablePCRSigning {
+		go podIdentitySignerController.Run(ctx, *workersPerSigner)
+	}
+
+	if *tokenMintListenAddress != "" {
+		if *tokenMintServingDNSName == "" {
+			slog.ErrorContext(ctx, "--token-mint-serving-dns-name is required when --token-mint-listen-address is set")
+			os.Exit(1)
+		}
+		if err := startTokenBroker(ctx, *tokenMintListenAddress, *tokenMintServingDNSName, *tokenMintAudience, kc, podIdentityCAPool, serviceDNSCAPool); err != nil {
+			slog.ErrorContext(ctx, "Error starting PodCertificateBroker listener", slog.Any("err", err))
+			os.Exit(1)
+		}
+	}
 
 	// TODO: Reload when the file changes.
 
