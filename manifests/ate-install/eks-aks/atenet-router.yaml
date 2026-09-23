@@ -187,7 +187,7 @@ spec:
             - ALL
         startupProbe:
           exec:
-            command: ["test", "-s", "/run/servicedns.podcert.ate.dev/credential-bundle.pem"]
+            command: ["/ko-app/podcertsidecar", "--check-file=/run/servicedns.podcert.ate.dev/credential-bundle.pem"]
           periodSeconds: 1
           failureThreshold: 60
       - name: podcert-sidecar-podidentity
@@ -230,7 +230,7 @@ spec:
             - ALL
         startupProbe:
           exec:
-            command: ["test", "-s", "/run/podidentity.podcert.ate.dev/credential-bundle.pem"]
+            command: ["/ko-app/podcertsidecar", "--check-file=/run/podidentity.podcert.ate.dev/credential-bundle.pem"]
           periodSeconds: 1
           failureThreshold: 60
       containers:

@@ -93,6 +93,14 @@ var (
 	podUID  = pflag.String("pod-uid", "", "This pod's UID, from the Downward API.")
 
 	showVersion = pflag.Bool("version", false, "Print version and exit.")
+
+	// checkFile turns this invocation into a one-shot startupProbe check
+	// instead of the normal mint-and-refresh loop: exit 0 if the file exists
+	// and is non-empty, exit 1 otherwise. This binary runs on a
+	// distroless/static base with no shell, so an exec probe can't use
+	// "test -s"; re-invoking the same static binary is what an exec probe
+	// can actually run.
+	checkFile = pflag.String("check-file", "", "If set, exit 0 if this file exists and is non-empty, exit 1 otherwise, and do nothing else.")
 )
 
 func main() {
@@ -100,6 +108,9 @@ func main() {
 	if *showVersion {
 		fmt.Println(version.String())
 		return
+	}
+	if *checkFile != "" {
+		os.Exit(checkFileReady(*checkFile))
 	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
@@ -144,6 +155,16 @@ func main() {
 			return
 		}
 	}
+}
+
+// checkFileReady returns 0 if path exists and is non-empty, 1 otherwise --
+// the exit code convention pflag.String("check-file", ...) above documents.
+func checkFileReady(path string) int {
+	fi, err := os.Stat(path)
+	if err != nil || fi.Size() == 0 {
+		return 1
+	}
+	return 0
 }
 
 func parsePurpose(s string) (podcertbrokerpb.SignerPurpose, error) {
