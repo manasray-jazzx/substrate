@@ -42,6 +42,15 @@ import (
 // CA pool.
 type EgressMITMTrustReconciler struct {
 	client.Client
+	// SkipClusterTrustBundle, when true, skips every ClusterTrustBundle
+	// read/write and its Watch registration: only the ConfigMap mirror is
+	// maintained. Set on clusters where certificates.k8s.io/v1beta1's
+	// ClusterTrustBundle kind is not served at all -- attempting either
+	// would fail on every call (not a k8errors.IsNotFound case, since the
+	// kind itself is unregistered) and, left in SetupWithManager's Watch,
+	// would repeatedly fail the manager's own startup. See
+	// docs/dev/eks-aks-workaround.md.
+	SkipClusterTrustBundle bool
 }
 
 // EgressMITMCAPoolRef names the Secret holding the CA pool the egress gateway's
@@ -89,17 +98,20 @@ func (r *EgressMITMTrustReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// entirely (its feature gates unavailable, e.g. on a managed control
 	// plane) must still get a working ConfigMap mirror, and one write's
 	// failure must not skip the other.
-	ctbAC := buildEgressMITMTrustBundleApplyConfig(trustBundle)
 	var errs []error
-	// Server-side apply rather than get-then-update: it creates and updates
-	// through one call, and it reverts hand edits to the fields owned here
-	// without clobbering anything a different manager legitimately set.
-	if err := r.Apply(ctx, ctbAC, client.FieldOwner(egressMITMTrustFieldOwner), client.ForceOwnership); err != nil {
-		errs = append(errs, fmt.Errorf("failed to apply ClusterTrustBundle %q: %w", *ctbAC.Name, err))
-	} else {
-		log.Info("reconciled the egress MITM trust bundle",
-			"name", *ctbAC.Name,
-			"secret", req.NamespacedName.String())
+	if !r.SkipClusterTrustBundle {
+		ctbAC := buildEgressMITMTrustBundleApplyConfig(trustBundle)
+		// Server-side apply rather than get-then-update: it creates and
+		// updates through one call, and it reverts hand edits to the fields
+		// owned here without clobbering anything a different manager
+		// legitimately set.
+		if err := r.Apply(ctx, ctbAC, client.FieldOwner(egressMITMTrustFieldOwner), client.ForceOwnership); err != nil {
+			errs = append(errs, fmt.Errorf("failed to apply ClusterTrustBundle %q: %w", *ctbAC.Name, err))
+		} else {
+			log.Info("reconciled the egress MITM trust bundle",
+				"name", *ctbAC.Name,
+				"secret", req.NamespacedName.String())
+		}
 	}
 
 	cmAC := buildEgressMITMTrustBundleConfigMapApplyConfig(trustBundle)
@@ -181,8 +193,10 @@ func egressMITMTrustBundlePEM(secret *corev1.Secret) (string, error) {
 
 func (r *EgressMITMTrustReconciler) deleteTrustBundle(ctx context.Context) error {
 	var errs []error
-	if err := r.deleteClusterTrustBundle(ctx); err != nil {
-		errs = append(errs, err)
+	if !r.SkipClusterTrustBundle {
+		if err := r.deleteClusterTrustBundle(ctx); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if err := r.deleteTrustBundleConfigMap(ctx); err != nil {
 		errs = append(errs, err)
@@ -238,18 +252,24 @@ func (r *EgressMITMTrustReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// The pool Secret is the only object reconciled from. The bundle and its
 	// ConfigMap mirror are watched as well so that deleting or hand-editing
 	// either derived object is reverted rather than silently accepted.
-	return ctrl.NewControllerManagedBy(mgr).
+	bldr := ctrl.NewControllerManagedBy(mgr).
 		Named("egressmitmtrust").
 		For(&corev1.Secret{}, builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
 			return obj.GetNamespace() == poolRef.Namespace && obj.GetName() == poolRef.Name
-		}))).
-		Watches(&certsv1beta1.ClusterTrustBundle{},
+		})))
+	if !r.SkipClusterTrustBundle {
+		// Registering this Watch when the kind is unregistered would fail
+		// the manager's own cache sync and crash the whole binary, not just
+		// this controller -- see SkipClusterTrustBundle's doc comment.
+		bldr = bldr.Watches(&certsv1beta1.ClusterTrustBundle{},
 			handler.EnqueueRequestsFromMapFunc(func(context.Context, client.Object) []reconcile.Request {
 				return []reconcile.Request{{NamespacedName: poolRef}}
 			}),
 			builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
 				return obj.GetName() == egressMITMTrustBundleName
-			}))).
+			})))
+	}
+	return bldr.
 		Watches(&corev1.ConfigMap{},
 			handler.EnqueueRequestsFromMapFunc(func(context.Context, client.Object) []reconcile.Request {
 				return []reconcile.Request{{NamespacedName: poolRef}}

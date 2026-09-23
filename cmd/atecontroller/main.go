@@ -33,10 +33,12 @@ import (
 	prombridge "go.opentelemetry.io/contrib/bridges/prometheus"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
+	certsv1beta1 "k8s.io/api/certificates/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -76,6 +78,11 @@ var (
 	ateapiCAFile     = pflag.String("ateapi-ca-file", ateapiauth.DefaultServiceAccountCAFile, "PEM file with CAs trusted to verify the ateapi server cert.")
 	ateapiServerName = pflag.String("ateapi-server-name", "", "SNI / hostname expected on the ateapi server cert. Optional.")
 	ateapiClientCert = pflag.String("ateapi-client-cert", "", "Credential bundle presented as the client certificate when dialing ateapi. Required.")
+
+	workerTokenBrokerAddress = pflag.String("worker-token-broker-address", "",
+		"If set, every worker pod mints its atunnel certificates from podcertcontroller's PodCertificateBroker RPC at this address (host:port) instead of PodCertificateRequest, for clusters where that API is unavailable. Empty (default) keeps the existing PodCertificateRequest-based volumes.")
+	workerTokenBrokerSidecarImage = pflag.String("worker-token-broker-sidecar-image", "",
+		"Image reference for the podcert-sidecar-podidentity init container added to every worker pod when --worker-token-broker-address is set. Must already be a resolved image reference (e.g. what `ko resolve` rewrites a ko:// string in this static manifest to), since this flag's value is emitted by this controller's own running binary rather than processed by ko itself. Required when --worker-token-broker-address is set.")
 )
 
 func init() {
@@ -84,6 +91,26 @@ func init() {
 }
 
 const serviceName = "atecontroller"
+
+// clusterTrustBundleV1beta1Available reports whether this cluster's API
+// server serves certificates.k8s.io/v1beta1's ClusterTrustBundle kind. It is
+// absent on managed clusters (EKS/AKS) whose control plane exposes no alpha
+// feature gates, and on clusters where the API has moved to v1 -- see
+// docs/dev/eks-aks-workaround.md. A capability probe, not a flag: unlike an
+// operator-set flag, it cannot disagree with what the cluster actually
+// serves.
+func clusterTrustBundleV1beta1Available(disc discovery.DiscoveryInterface) bool {
+	resources, err := disc.ServerResourcesForGroupVersion(certsv1beta1.SchemeGroupVersion.String())
+	if err != nil {
+		return false
+	}
+	for _, r := range resources.APIResources {
+		if r.Kind == "ClusterTrustBundle" {
+			return true
+		}
+	}
+	return false
+}
 
 // logr verbosity V(n) maps to slog level -n, so V(1) stays below Info until
 // --log-level=debug. logr carries no context, so these records have no trace IDs.
@@ -101,6 +128,9 @@ func main() {
 	serverboot.InitLogger()
 	if err := serverboot.SetLogLevel(*logLevelFlag); err != nil {
 		serverboot.Fatal(ctx, "Invalid --log-level", err)
+	}
+	if *workerTokenBrokerAddress != "" && *workerTokenBrokerSidecarImage == "" {
+		serverboot.Fatal(ctx, "--worker-token-broker-sidecar-image is required when --worker-token-broker-address is set", nil)
 	}
 	slog.InfoContext(ctx, "atecontroller starting", slog.String("version", version.Version))
 	ctrl.SetLogger(newControllerRuntimeLogger(slog.Default().Handler()))
@@ -181,13 +211,15 @@ func main() {
 	}
 
 	if err = (&controllers.WorkerPoolReconciler{
-		Client:                   mgr.GetClient(),
-		Scheme:                   mgr.GetScheme(),
-		OTelEndpoint:             *otelEndpoint,
-		OTelMetricExportInterval: *otelMetricExportInterval,
-		OTelMetricExportTimeout:  *otelMetricExportTimeout,
-		OTelTracesSampler:        *otelTracesSampler,
-		OTelTracesSamplerArg:     *otelTracesSamplerArg,
+		Client:                        mgr.GetClient(),
+		Scheme:                        mgr.GetScheme(),
+		OTelEndpoint:                  *otelEndpoint,
+		OTelMetricExportInterval:      *otelMetricExportInterval,
+		OTelMetricExportTimeout:       *otelMetricExportTimeout,
+		OTelTracesSampler:             *otelTracesSampler,
+		OTelTracesSamplerArg:          *otelTracesSamplerArg,
+		WorkerTokenBrokerAddress:      *workerTokenBrokerAddress,
+		WorkerTokenBrokerSidecarImage: *workerTokenBrokerSidecarImage,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "WorkerPool")
 		os.Exit(1)
@@ -201,8 +233,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	ctbAvailable := clusterTrustBundleV1beta1Available(k8sClient.Discovery())
+	if !ctbAvailable {
+		slog.InfoContext(ctx, "certificates.k8s.io/v1beta1 ClusterTrustBundle is not served by this cluster; the egress MITM trust anchor will only be published as a ConfigMap mirror")
+	}
 	if err = (&controllers.EgressMITMTrustReconciler{
-		Client: mgr.GetClient(),
+		Client:                 mgr.GetClient(),
+		SkipClusterTrustBundle: !ctbAvailable,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "EgressMITMTrust")
 		os.Exit(1)

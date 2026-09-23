@@ -204,7 +204,11 @@ spec:
       - name: atelet
         image: ko://github.com/agent-substrate/substrate/cmd/atelet
         args:
-        - --gcp-auth-for-image-pulls=true
+        # Unlike the base manifest, this is off: GCP application default
+        # credentials assume a GKE node's metadata server, which a managed
+        # non-GCP cluster (EKS/AKS) has no equivalent of. Worker images are
+        # expected to come from a registry that does not need it.
+        - --gcp-auth-for-image-pulls=false
         - --grpc-server-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem
         - --client-ca-certs=/run/podidentity-ca/trust-bundle.pem
         - --ateapi-ca-file=/run/servicedns.podcert.ate.dev/trust-bundle.pem
@@ -252,13 +256,29 @@ spec:
               fieldPath: metadata.uid
         - name: OTEL_RESOURCE_ATTRIBUTES
           value: k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.pod.uid=$(POD_UID),k8s.node.name=$(NODE_NAME),service.instance.id=$(POD_UID)
-        - name: ATE_STORAGE_BACKEND
-          value: "gcs"
+        # Unlike the base manifest, ATE_STORAGE_BACKEND is not set to "gcs"
+        # here: GCS application default credentials assume a GKE node's
+        # metadata server, which a managed non-GCP cluster (EKS/AKS) has no
+        # equivalent of, and atelet creates its storage client eagerly at
+        # startup (cmd/atelet/main.go), so a bad default would crash-loop it
+        # immediately rather than only failing the operations that use it.
+        # It comes instead from the per-developer/per-deployment ConfigMap
+        # and Secret below, in whatever shape that cluster's real backend
+        # needs -- see manifests/ate-install/kind/atelet/kustomization.yaml
+        # for the env vars an "s3" backend needs, as one example.
+        #
         # OTLP exporter settings are shared by every control plane component;
-        # see manifests/ate-install/ate-otel-config.yaml.
+        # see manifests/ate-install/ate-otel-config.yaml. Listed first so the
+        # per-developer ConfigMap/Secret below can still override a key.
         envFrom:
         - configMapRef:
             name: ate-otel-config
+        - configMapRef:
+            name: atelet-envvars
+            optional: true
+        - secretRef:
+            name: atelet-secret-envvars
+            optional: true
         ports:
         - name: grpc
           containerPort: 8085

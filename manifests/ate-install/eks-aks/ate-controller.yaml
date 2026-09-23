@@ -156,6 +156,22 @@ spec:
         args:
         - --ateapi-ca-file=/run/servicedns-ca/trust-bundle.pem
         - --ateapi-client-cert=/run/podidentity.podcert.ate.dev/credential-bundle.pem
+        # Every worker pod atecontroller creates is, functionally, another
+        # PodCertificateRequest consumer (atunnel's own identity inside
+        # ateom) -- unavailable on this cluster, so worker pods mint through
+        # podcertcontroller's broker RPC too. See
+        # cmd/atecontroller/internal/controllers/workerpool_apply.go and
+        # docs/dev/eks-aks-workaround.md.
+        - --worker-token-broker-address=podcertificate-controller.podcertificate-controller-system.svc:8443
+        # ko resolve only rewrites a ko:// reference when it is a whole
+        # scalar value in the YAML tree, not a substring of a larger one --
+        # so the flag and its value are two separate args, unlike the
+        # --flag=value form used elsewhere in this file. This is what lets
+        # this static manifest hand atecontroller's own running Go code (see
+        # workerpool_apply.go's tokenBrokerSettings) an already-resolved
+        # image reference, since that code is never itself processed by ko.
+        - --worker-token-broker-sidecar-image
+        - ko://github.com/agent-substrate/substrate/cmd/podcertsidecar
         env:
         - name: POD_NAME
           valueFrom:

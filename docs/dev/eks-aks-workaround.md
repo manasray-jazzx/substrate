@@ -7,10 +7,18 @@ workaround. It's now implemented: `cmd/podcertcontroller/internal/tokenbroker`,
 `cmd/podcertsidecar`, `internal/identitycert`, and
 `manifests/ate-install/eks-aks/` on this branch. The design held up well
 against the real code — the shape described below is close to what shipped
-— but a handful of details turned out different once built, and live
-testing against a real cluster caught two real bugs static review missed.
-Both are called out explicitly below rather than silently corrected, since
-the gap between "designed" and "built" is worth keeping visible.
+— but a handful of details turned out different once built, and three
+separate rounds of live testing against real clusters caught real bugs
+static review missed: two from the first pass against `podcertcontroller`
+alone (see "The sidecar" below), one from actually standing up the bundled
+Postgres (see "seven manifests" below), and four more from deploying and
+exercising the *entire* stack end to end — `atecontroller`, worker pods,
+and `atelet`, not just the identity-minting path — for the first time (see
+"Worker pods: a ninth, differently-shaped consumer" and "Three more bugs
+from full-stack live testing" below). Every one is called out explicitly
+rather than silently corrected, since the gap between "designed" and
+"built" — and between "the minting path works" and "the whole stack comes
+up" — is worth keeping visible.
 
 ## The blocker: `PodCertificateRequest` + `ClusterTrustBundle`
 
@@ -102,6 +110,12 @@ deployment once the PKI issue above is resolved:
   backends (`ATE_STORAGE_BACKEND=s3` switches to S3). S3 is native on AWS.
   Azure has no native S3 API, so AKS would need an S3-compatible endpoint
   (self-hosted MinIO, or similar) until a native Azure Blob backend exists.
+  Unlike `ate-api-server` (which only touches the backend for specific
+  operations, so a bad default just fails those), `atelet` constructs its
+  storage client eagerly at startup — see "Three more bugs from full-stack
+  live testing" below for the crash this caused and how
+  `manifests/ate-install/eks-aks/atelet.yaml` now leaves the choice to a
+  per-deployment ConfigMap/Secret instead of a hardcoded default.
 - **Worker pod capabilities**: `cmd/atecontroller/internal/controllers/workerpool_apply.go`
   adds `NET_ADMIN`, `SYS_ADMIN`, `SYS_CHROOT`, `SYS_PTRACE` to worker pods
   (gVisor's `runsc` runs inside the pod, not via a node-level containerd
@@ -242,6 +256,45 @@ itself (exit 0 if the file exists and is non-empty, exit 1 otherwise), so
 the probe re-invokes the same static binary — `exec: ["/ko-app/podcertsidecar",
 "--check-file=<path>"]` — instead of needing a shell.
 
+### Worker pods: a ninth, differently-shaped consumer
+
+Every worker pod `atecontroller` creates carries its own `atunnel` identity,
+provisioned exactly like the six static consumers above — but
+`cmd/atecontroller/internal/controllers/workerpool_apply.go` builds that pod
+spec dynamically, in Go, at reconcile time, rather than reading it from a
+YAML file. This surfaced only once this branch's own full-stack live testing
+got as far as actually creating a `WorkerPool` and watching its pod, well
+after the six-manifest and Postgres gaps above were already fixed — the
+identity path can look fully solved from `hack/verify-eks-aks-pki.sh` and a
+healthy control plane alone, and still leave every worker pod unable to
+start.
+
+The fix mirrors the static-manifest pattern (`applyAtunnelPKIVolumes`
+builds the same emptyDir/ConfigMap/serviceAccountToken volumes and
+`podcert-sidecar-podidentity` init container, gated on a new
+`tokenBrokerSettings.Address` parameter, empty by default), wired through a
+new `WorkerPoolReconciler.WorkerTokenBrokerAddress` field and
+`--worker-token-broker-address` flag on `atecontroller`.
+
+**The image reference caught a real bug specific to this consumer being
+Go code, not YAML.** `ko resolve` only rewrites a `ko://` string when it is
+a *whole scalar value* somewhere in a static YAML file it's pointed at —
+confirmed empirically: `ko resolve` left a `ko://...` string untouched when
+it appeared as a substring inside a larger `--flag=value` arg, and only
+rewrote it once split into two separate YAML list elements
+(`- --flag` / `- ko://...`), each its own whole string. A Go string constant
+hardcoded in `workerpool_apply.go` and passed to `WithImage` is therefore
+never touched by `ko` at all — it reaches Kubernetes as the literal text
+`ko://github.com/...`, an invalid image reference
+(`Init:InvalidImageName`), regardless of when or how the binary was built.
+The fix threads the resolved image reference in from outside instead:
+`tokenBrokerSettings.SidecarImage`, a new `WorkerPoolReconciler` field and
+`--worker-token-broker-sidecar-image` flag, set in
+`manifests/ate-install/eks-aks/ate-controller.yaml` as two separate arg-list
+elements specifically so `ko resolve` — which processes that static
+manifest before `atecontroller` ever runs — rewrites it before
+`atecontroller`'s own (never-`ko`-processed) binary ever sees the value.
+
 ### `podcertcontroller`'s own RPC handler
 
 `tokenbroker.Server.MintPodCertificate`:
@@ -311,9 +364,82 @@ Confirmed by direct reading, not inference:
   EKS/AKS; this half of Substrate's security story was never blocked by the
   alpha APIs. Only the internal service-to-service mTLS bootstrap
   (`podcertcontroller`) is affected.
-- All six consumer binaries (`atelet`, `ate-api-server`, `ate-controller`,
+- The PKI bootstrap itself required zero Go code changes in any of the six
+  static consumer binaries (`atelet`, `ate-api-server`, `ate-controller`,
   `atenet-router`, `atenet-egress`, `atenet-egress-with-sdsmint`'s
-  containers) — zero Go code changes. Only their manifests changed.
+  containers) or in `ateom`/worker pods — only manifests, plus
+  `workerpool_apply.go` for the ninth consumer above. `atelet` and
+  `atecontroller` did each need one small, unrelated Go fix once full-stack
+  live testing exercised them for the first time — see "Three more bugs
+  from full-stack live testing" below.
+
+### Three more bugs from full-stack live testing
+
+Getting a worker pod healthy (previous section) still left `atecontroller`
+and `atelet` themselves unreliable on a cluster that serves neither
+`certificates.k8s.io/v1beta1` nor GCP application default credentials —
+found only once the *entire* stack was deployed and exercised together,
+not just `podcertcontroller` and the identity-minting path in isolation:
+
+- **`atecontroller` crash-looped every ~10s.**
+  `egressmitmtrust_controller.go`'s `SetupWithManager` unconditionally
+  registers a `Watches(&certsv1beta1.ClusterTrustBundle{}, ...)`
+  EventSource. When the kind isn't registered at all, controller-runtime's
+  cache-sync for that source times out, `Start()` returns an error, and by
+  design the *whole* manager — every controller in the binary, not just
+  this one — shuts down; `main()` then exits 1 and kubelet restarts the
+  container, over and over. The brief window between each restart and the
+  next crash was long enough for a `WorkerPool` reconcile to occasionally
+  slip through, which is why this stayed hidden through earlier, shorter
+  testing. Fixed with a one-time discovery probe at startup
+  (`clusterTrustBundleV1beta1Available`, via `k8sClient.Discovery()`) rather
+  than a new flag: unlike an operator-set flag, a capability probe cannot
+  disagree with what the cluster actually serves, and
+  `certificates.k8s.io` API listing confirms `ClusterTrustBundle` and
+  `PodCertificateRequest` are coupled (both present or both absent at a
+  given version) on every cluster checked so far, so one probe covers both.
+  `EgressMITMTrustReconciler.SkipClusterTrustBundle`, set from that probe,
+  skips the `Watch` registration *and* the `ClusterTrustBundle` apply/delete
+  calls in `Reconcile` — skipping only the `Watch` would have stopped the
+  crash-loop but left every reconcile returning an error and requeuing with
+  backoff forever, since `k8errors.IsNotFound` does not match a RESTMapper
+  "no matches for kind" error. The `ConfigMap` mirror (see "Trust-bundle
+  distribution" above) is unaffected either way — it was already
+  independent of the `ClusterTrustBundle` write's success.
+- **`atelet` never started its `AteomSupport` socket, so every worker pod on
+  the node hung indefinitely retrying its capacity report.** `atelet`'s
+  `main()` similarly maintains a `ClusterTrustBundle` informer — for
+  `systeminfovolume.go`'s egress-mitm trust bundle feature, `EgressTrustBundleName`, unrelated to
+  `atelet`'s own identity — and called
+  `clusterTrustBundleInformerFactory.WaitForCacheSync(stopCh)`
+  *synchronously*, before reaching the code that listens on
+  `ateompath.AteomSupportSocket` further down the same function. On a
+  cluster where that kind never syncs, this wait never returns, so
+  `atelet` never reaches the listener at all — not a crash, just permanent
+  startup stall, silent apart from repeating reflector errors. Fixed by
+  moving that specific `WaitForCacheSync` into a background goroutine: the
+  feature it gates is already best-effort (the lister just serves `NotFound`
+  until, if ever, it syncs), so nothing downstream actually needed the
+  synchronous wait.
+- **`atelet` also crash-looped, from two unrelated eager GCP dependencies.**
+  `--gcp-auth-for-image-pulls` (default `true`) calls
+  `googlecontainerauth.NewEnvAuthenticator`, and the default
+  `ATE_STORAGE_BACKEND` (`gcs`) calls `ategcs.NewGCSClient` with real
+  authentication — both at startup, both assuming a GKE node's metadata
+  server for GCP application default credentials, which a managed non-GCP
+  cluster has no equivalent of. Neither is part of the PKI bootstrap this
+  document otherwise covers, but both are eager enough to crash-loop
+  `atelet` immediately, the same way the PKI gaps did, so they had to be
+  fixed to get this far. `manifests/ate-install/eks-aks/atelet.yaml` sets
+  `--gcp-auth-for-image-pulls=false` and no longer sets `ATE_STORAGE_BACKEND`
+  directly; it comes instead from an optional, per-deployment
+  `atelet-envvars` ConfigMap / `atelet-secret-envvars` Secret (the same
+  "customize without editing this manifest" pattern
+  `ate-api-server.yaml` already uses for its Postgres DSN), in whatever
+  shape the target cluster's real backend needs —
+  `manifests/ate-install/kind/atelet/kustomization.yaml` shows the env vars
+  an `s3`-compatible backend (e.g. a self-hosted MinIO/rustfs, or AWS S3
+  itself) needs.
 
 ### RBAC
 

@@ -356,3 +356,39 @@ func TestEgressMITMTrustDeletesConfigMapMirrorWhenPoolIsGone(t *testing.T) {
 		t.Error("the trust bundle ConfigMap mirror outlived its CA pool")
 	}
 }
+
+// On a cluster without certificates.k8s.io/v1beta1's ClusterTrustBundle kind,
+// SkipClusterTrustBundle must keep the ConfigMap mirror working -- the only
+// trust-bundle distribution mechanism such a cluster has -- while touching no
+// ClusterTrustBundle object, on both the apply and delete paths.
+func TestEgressMITMTrustSkipsClusterTrustBundleWhenUnavailable(t *testing.T) {
+	t.Parallel()
+	scheme := egressMITMScheme(t)
+	secret, pool := caPoolSecret(t, "mitm")
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	r := &EgressMITMTrustReconciler{Client: c, SkipClusterTrustBundle: true}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: EgressMITMCAPoolRef()}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := getTrustBundle(t, c); ok {
+		t.Error("a ClusterTrustBundle was created with SkipClusterTrustBundle set")
+	}
+	cm, ok := getTrustBundleConfigMap(t, c)
+	if !ok {
+		t.Fatal("no trust bundle ConfigMap mirror was created")
+	}
+	if got, want := cm.Data[egressMITMTrustBundleConfigMapDataKey], rootPEM(t, pool); got != want {
+		t.Errorf("ConfigMap mirror data =\n%s\nwant\n%s", got, want)
+	}
+
+	if err := c.Delete(context.Background(), secret); err != nil {
+		t.Fatalf("delete pool secret: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: EgressMITMCAPoolRef()}); err != nil {
+		t.Fatalf("delete Reconcile: %v", err)
+	}
+	if _, ok := getTrustBundleConfigMap(t, c); ok {
+		t.Error("the trust bundle ConfigMap mirror outlived its CA pool")
+	}
+}
