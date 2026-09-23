@@ -377,6 +377,22 @@ func TestWriteRoundTripsThroughParse(t *testing.T) {
 	}
 }
 
+func TestWriteSetsGroupReadableMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bundle.pem")
+
+	if err := Write(path, generateRSAKey(t), [][]byte{generateCertificate(t, 1)}); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if got, want := fi.Mode().Perm(), os.FileMode(0o640); got != want {
+		t.Fatalf("mode = %o, want %o (group-readable, for a consumer sharing a pod-level fsGroup with a different UID than whatever wrote this file)", got, want)
+	}
+}
+
 func TestWriteDoesNotLeaveTempFileBehind(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bundle.pem")

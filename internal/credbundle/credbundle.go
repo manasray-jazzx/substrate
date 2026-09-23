@@ -247,7 +247,16 @@ func writeFileAtomic(path string, data []byte) error {
 		_ = tmp.Close()
 		return fmt.Errorf("while writing temp file: %w", err)
 	}
-	if err := tmp.Chmod(0o600); err != nil {
+	// 0640, not 0600: a consumer that runs as a different, non-root UID from
+	// whatever wrote this file (e.g. postgres.yaml's postgres container,
+	// sharing a pod-level fsGroup with its tls-reloader sidecar rather than
+	// running as the same user) can only read it via the fsGroup-granted
+	// group bit. This matches what kubelet's own podCertificate mechanism
+	// produces in practice for an fsGroup-using pod -- see the comment on
+	// postgres.yaml's servicedns volume ("0600 plus the group read that
+	// fsGroup adds is the 0640 above") -- kubelet's declared mode is 0600
+	// but fsGroup's group-read grant is layered on top of it regardless.
+	if err := tmp.Chmod(0o640); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("while setting temp file permissions: %w", err)
 	}

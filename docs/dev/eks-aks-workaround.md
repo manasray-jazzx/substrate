@@ -19,7 +19,9 @@ Every internal service identity in Substrate — `atelet`'s serving cert,
 `atenet-egress`'s certs, the egress MITM trust bundle — is provisioned
 through a `podCertificate` projected volume source and read back via a
 `certificates.k8s.io/v1beta1 ClusterTrustBundle` object. This appears in
-six Deployment manifests:
+seven manifests -- six Deployments plus the bundled `postgres`
+StatefulSet, found only once this branch's own full-stack live testing
+actually stood up Postgres rather than just `podcertcontroller`:
 
 - `manifests/ate-install/atelet.yaml`
 - `manifests/ate-install/ate-api-server.yaml`
@@ -27,6 +29,7 @@ six Deployment manifests:
 - `manifests/ate-install/atenet-router.yaml`
 - `manifests/ate-install/atenet-egress.yaml`
 - `manifests/ate-install/atenet-egress-with-sdsmint.yaml`
+- `manifests/ate-install/postgres/postgres.yaml`
 
 For example, `manifests/ate-install/atelet.yaml:276-288`:
 
