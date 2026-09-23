@@ -1,0 +1,277 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: podcertificate-controller-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: podcert-ate-dev-signer
+rules:
+# The service signer needs to be able to read services and pods.
+- apiGroups:
+  - ""
+  resources:
+  - services
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - certificates.k8s.io
+  resources:
+  - podcertificaterequests
+  verbs:
+  - get
+  - list
+  - watch
+  - update
+- apiGroups:
+  - certificates.k8s.io
+  resources:
+  - clustertrustbundles
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+  - update
+  - delete
+- apiGroups:
+  - certificates.k8s.io
+  resources:
+  - podcertificaterequests/status
+  verbs:
+  - update
+- apiGroups:
+  - certificates.k8s.io
+  resources:
+  - signers
+  resourceNames:
+  - servicedns.podcert.ate.dev/*
+  - podidentity.podcert.ate.dev/*
+  verbs:
+  - sign
+  - attest
+- apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: podcert-ate-dev-signer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: podcert-ate-dev-signer
+subjects:
+- kind: ServiceAccount
+  namespace: podcertificate-controller-system
+  name: default
+---
+# Additive, managed-cluster-only RBAC for the TokenReview-authenticated
+# PodCertificateBroker RPC and its ConfigMap trust-bundle mirror -- kept
+# separate from podcert-ate-dev-signer above rather than folded into it, so
+# this grant is visibly scoped to the managed-cluster path.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: podcert-token-broker
+rules:
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+# Cluster-wide rather than scoped to ate-system: RBAC has no cross-namespace
+# Role+RoleBinding without depending on ate-system already existing by the
+# time this applies. Narrow this to a namespaced Role+RoleBinding in
+# ate-system if that ordering is guaranteed in your install.
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: podcert-token-broker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: podcert-token-broker
+subjects:
+- kind: ServiceAccount
+  namespace: podcertificate-controller-system
+  name: default
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: podcertificate-controller
+  namespace: podcertificate-controller-system
+  labels:
+    app: podcertificate-controller
+spec:
+  selector:
+    app: podcertificate-controller
+  ports:
+  - name: token-mint
+    port: 8443
+    targetPort: 8443
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: podcertificate-controller-system
+  name: coordinator
+rules:
+- apiGroups:
+  - "coordination.k8s.io"
+  resources:
+  - "leases"
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+  - update
+  - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: podcertificate-controller-is-a-coordinator
+  namespace: podcertificate-controller-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: coordinator
+subjects:
+- kind: ServiceAccount
+  namespace: podcertificate-controller-system
+  name: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podcertificate-controller
+  namespace: podcertificate-controller-system
+  labels:
+    app: podcertificate-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: podcertificate-controller
+  template:
+    metadata:
+      labels:
+        app: podcertificate-controller
+    spec:
+      containers:
+      - name: controller
+        image: ko://github.com/agent-substrate/substrate/cmd/podcertcontroller
+        args:
+        - --in-cluster=true
+        - --sharding-pod-namespace=$(POD_NAMESPACE)
+        - --sharding-pod-name=$(POD_NAME)
+        - --sharding-pod-uid=$(POD_UID)
+        - --sharding-application-name=podcertificate-controller
+        - --service-dns-ca-pool=/run/ca-state/service-dns-pool.json
+        - --pod-identity-ca-pool=/run/ca-state/pod-identity-pool.json
+        - --workers-per-signer=$(WORKERS_PER_SIGNER)
+        # Managed-cluster path: PodCertificateRequest is unavailable, so stop
+        # watching/signing it, but keep publishing trust bundles (now also
+        # mirrored to a ConfigMap, since ClusterTrustBundle is unavailable
+        # too) and start serving the TokenReview-authenticated broker RPC
+        # sidecars mint through instead.
+        - --enable-pcr-signing=false
+        - --trust-bundle-configmap-namespace=ate-system
+        - --token-mint-listen-address=:8443
+        - --token-mint-serving-dns-name=podcertificate-controller.podcertificate-controller-system.svc
+        ports:
+        - name: token-mint
+          containerPort: 8443
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: WORKERS_PER_SIGNER
+          value: "1"
+        volumeMounts:
+        - name: "ca-state"
+          mountPath: "/run/ca-state"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            add:
+            - NET_BIND_SERVICE
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+      volumes:
+      - name: "ca-state"
+        projected:
+          sources:
+          - secret:
+              name: "service-dns-ca-pool"
+              items:
+              - key: "pool"
+                path: "service-dns-pool.json"
+          - secret:
+              name: "pod-identity-ca-pool"
+              items:
+              - key: "pool"
+                path: "pod-identity-pool.json"
+      dnsPolicy: Default
+      nodeSelector:
+        kubernetes.io/os: linux
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      serviceAccountName: default
+      terminationGracePeriodSeconds: 30

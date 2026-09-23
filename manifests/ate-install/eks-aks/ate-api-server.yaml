@@ -1,0 +1,401 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+# Define Permissions (Read-Only for Pods)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ate-api-server
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["ate.dev"]
+  resources: ["workerpools", "sandboxconfigs", "csidriverconfigs"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["ate.dev"]
+  resources: ["workerpools"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["storageclasses"]
+  verbs: ["get", "watch", "list"]
+---
+# Create Service Account for Workload Identity
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ate-api-server
+  namespace: ate-system
+---
+# 4. Bind Identity to Permissions
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ate-api-server
+subjects:
+- kind: ServiceAccount
+  name: ate-api-server
+  namespace: ate-system
+roleRef:
+  kind: ClusterRole
+  name: ate-api-server
+  apiGroup: rbac.authorization.k8s.io
+---
+# 5. Deploy the API Server
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ate-api-server
+  namespace: ate-system
+spec:
+  replicas: 2
+  strategy:
+    # Update replicas one at a time, create a new one first, then delete the old one.
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: ate-api-server
+  template:
+    metadata:
+      labels:
+        app: ate-api-server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      # TODO: Add topologySpreadConstraints to spread replicas across nodes and zones.
+      serviceAccountName: ate-api-server
+      # Budget for the full shutdown sequence: --drain-delay (sized to cover
+      # the readinessProbe below reaching NotReady, plus propagation) +
+      # --drain-timeout.
+      terminationGracePeriodSeconds: 40
+      # Managed-cluster path: PodCertificateRequest is unavailable, so these
+      # mint ate-api-server's servicedns (serving) and podidentity (client)
+      # certificates from podcertcontroller's PodCertificateBroker RPC
+      # instead of kubelet-managed podCertificate volumes. Both share the
+      # same podcert-token bound-token volume -- the audience it requests is
+      # the same regardless of which purpose a given sidecar mints.
+      initContainers:
+      - name: podcert-sidecar-servicedns
+        image: ko://github.com/agent-substrate/substrate/cmd/podcertsidecar
+        restartPolicy: Always
+        args:
+        - --purpose=servicedns
+        - --broker-address=podcertificate-controller.podcertificate-controller-system.svc:8443
+        - --token-path=/var/run/secrets/podcert.ate.dev/token
+        - --trust-bundle-path=/run/servicedns-ca/trust-bundle.pem
+        - --credential-bundle-path=/run/servicedns.podcert.ate.dev/credential-bundle.pem
+        - --pod-name=$(POD_NAME)
+        - --pod-uid=$(POD_UID)
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        volumeMounts:
+        - name: podcert-token
+          mountPath: /var/run/secrets/podcert.ate.dev
+          readOnly: true
+        - name: servicedns-ca
+          mountPath: /run/servicedns-ca
+          readOnly: true
+        - name: servicedns
+          mountPath: /run/servicedns.podcert.ate.dev
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        startupProbe:
+          exec:
+            command: ["test", "-s", "/run/servicedns.podcert.ate.dev/credential-bundle.pem"]
+          periodSeconds: 1
+          failureThreshold: 60
+      - name: podcert-sidecar-podidentity
+        image: ko://github.com/agent-substrate/substrate/cmd/podcertsidecar
+        restartPolicy: Always
+        args:
+        - --purpose=podidentity
+        - --broker-address=podcertificate-controller.podcertificate-controller-system.svc:8443
+        - --token-path=/var/run/secrets/podcert.ate.dev/token
+        - --trust-bundle-path=/run/servicedns-ca/trust-bundle.pem
+        - --credential-bundle-path=/run/podidentity.podcert.ate.dev/credential-bundle.pem
+        - --pod-name=$(POD_NAME)
+        - --pod-uid=$(POD_UID)
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        volumeMounts:
+        - name: podcert-token
+          mountPath: /var/run/secrets/podcert.ate.dev
+          readOnly: true
+        - name: servicedns-ca
+          mountPath: /run/servicedns-ca
+          readOnly: true
+        - name: podidentity
+          mountPath: /run/podidentity.podcert.ate.dev
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        startupProbe:
+          exec:
+            command: ["test", "-s", "/run/podidentity.podcert.ate.dev/credential-bundle.pem"]
+          periodSeconds: 1
+          failureThreshold: 60
+      containers:
+      - name: ate-api-server
+        image: ko://github.com/agent-substrate/substrate/cmd/ateapi
+        args:
+          - "--grpc-server-cred-bundle=/run/servicedns.podcert.ate.dev/credential-bundle.pem"
+          - --authentication-config=/etc/ateapi/authentication/authentication.yaml
+          - --postgres-connection-string=@env
+          - --postgres-schema=@env
+          - --actor-id-jwt-pool=/run/actor-id-jwt-pool/pool.json
+          - --actor-id-ca-pool=/run/actor-id-ca-pool/pool.json
+          - --atelet-client-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem
+          - --pod-identity-ca-certs=/run/podidentity-ca/trust-bundle.pem
+          # TODO(lior):Remove when egress API pr is merged. This turns on pluggable actor
+          # egress cluster-wide. ateapi stamps this address onto every atelet
+          # Run/Restore, ateom hands it to atunnel, and actor TCP egress is
+          # transparently redirected (nftables) into atunnel, which wraps it in
+          # mTLS + HTTP CONNECT to the egress gateway.
+          - --egress-gateway-address=atenet-egress.ate-system.svc:443
+          # Graceful shutdown knobs. The sum must fit within terminationGracePeriodSeconds.
+          - --drain-delay=13s
+          - --drain-timeout=15s
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: OTEL_RESOURCE_ATTRIBUTES
+          value: k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.pod.uid=$(POD_UID),service.instance.id=$(POD_UID)
+        # ate-api copies external snapshots for tags and deletes the ones
+        # nothing refers to any more, so it needs the same backend atelet reads
+        # and writes them through.
+        - name: ATE_STORAGE_BACKEND
+          value: "gcs"
+        # OTLP exporter settings are shared by every control plane component;
+        # see manifests/ate-install/ate-otel-config.yaml. Listed first so the
+        # per-developer ConfigMap below can still override a key.
+        envFrom:
+        - configMapRef:
+            name: ate-otel-config
+        # Inject env vars from a ConfigMap created by each developer.  This lets
+        # each developer customize their own PostgreSQL connection settings without having
+        # to edit this manifest, which can remain constant across all
+        # developers.
+        - configMapRef:
+            name: ate-api-server-envvars
+            optional: true
+        # Sensitive env vars (e.g. a Postgres DSN carrying a password) live in
+        # a Secret rather than the ConfigMap above. Listed last so a key
+        # present in both takes its value from the Secret.
+        - secretRef:
+            name: ate-api-server-secret-envvars
+            optional: true
+        volumeMounts:
+        # servicedns: the apiserver's own gRPC serving cert (DNS SAN api.ate-system.svc).
+        - name: "servicedns"
+          mountPath: "/run/servicedns.podcert.ate.dev"
+        # podidentity: the apiserver's client identity (SPIFFE) when it dials
+        # the selected store and atelet, plus the trust bundle for verifying
+        # atelet's serving certificate.
+        - name: "podidentity"
+          mountPath: "/run/podidentity.podcert.ate.dev"
+        - name: "podidentity-ca"
+          mountPath: "/run/podidentity-ca"
+          readOnly: true
+        - name: "actor-id-jwt-pool"
+          mountPath: "/run/actor-id-jwt-pool"
+        - name: "actor-id-ca-pool"
+          mountPath: "/run/actor-id-ca-pool"
+          readOnly: true
+        - name: "authentication-config"
+          mountPath: "/etc/ateapi/authentication"
+          readOnly: true
+        # postgres-server-ca: server CA for an external Postgres, referenced
+        # by the DSN via sslrootcert (sslmode=verify-ca). Empty unless the
+        # postgres-server-ca Secret exists. Cloud SQL does not need this: it
+        # uses the Auth Proxy sidecar (see
+        # manifests/ate-install/cloudsql/proxy-sidecar-patch.yaml), which handles TLS
+        # itself.
+        - name: "postgres-server-ca"
+          mountPath: "/run/postgres-server-ca"
+          readOnly: true
+        ports:
+        - containerPort: 443
+        - name: prometheus
+          containerPort: 9090
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 9090
+          initialDelaySeconds: 5
+          periodSeconds: 2
+          failureThreshold: 3
+        # :9090 is bound near the end of boot, after the store connect and
+        # the schema migrations, so nothing answers here until both finish.
+        # The store connect alone budgets 60s (30 attempts, 2s apart) and the
+        # migrations serialize across replicas on an advisory lock. Without a
+        # startup probe the liveness probe below SIGTERMs the container at
+        # ~30s, halfway through that budget: the retry loop is rooted in the
+        # signal context, so it reports "context canceled" and the process
+        # exits into CrashLoopBackOff instead of waiting out a store that is
+        # merely slow to return. A booting replica is not a dead one.
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 9090
+          periodSeconds: 5
+          failureThreshold: 24
+        # /healthz stays 200 while a terminating pod drains; /readyz
+        # turns 503, so liveness and readiness diverge correctly during
+        # shutdown.
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 9090
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      volumes:
+      # Minted by the podcert-sidecar-servicedns / podcert-sidecar-podidentity
+      # init containers above rather than kubelet-managed podCertificate
+      # volumes (unavailable on this cluster). Writable so each sidecar can
+      # write its credential-bundle.pem into it; the ate-api-server container
+      # only ever reads from them.
+      - name: "servicedns"
+        emptyDir:
+          medium: Memory
+      - name: "podidentity"
+        emptyDir:
+          medium: Memory
+      # Trust anchors, from podcertcontroller's ConfigMap mirrors of the
+      # servicedns and podidentity ClusterTrustBundles (unavailable on this
+      # cluster). servicedns-ca is used by both sidecars above to verify the
+      # broker's own serving certificate, which is always servicedns-purpose
+      # regardless of what a given sidecar is minting; podidentity-ca is used
+      # by ate-api-server itself to verify atelet's client certificate.
+      - name: "servicedns-ca"
+        projected:
+          sources:
+          - configMap:
+              name: servicedns.podcert.ate.dev-identity-primary-bundle
+              items:
+              - key: trust-bundle.pem
+                path: trust-bundle.pem
+      - name: "podidentity-ca"
+        projected:
+          sources:
+          - configMap:
+              name: podidentity.podcert.ate.dev-identity-primary-bundle
+              items:
+              - key: trust-bundle.pem
+                path: trust-bundle.pem
+      # Bound token both sidecars present to podcertcontroller's
+      # PodCertificateBroker RPC to authenticate as this pod.
+      - name: "podcert-token"
+        projected:
+          sources:
+          - serviceAccountToken:
+              audience: podcertcontroller.ate.dev
+              expirationSeconds: 3600
+              path: token
+      - name: "actor-id-jwt-pool"
+        projected:
+          sources:
+          - secret:
+              name: "actor-id-jwt-pool"
+              items:
+              - key: "pool"
+                path: "pool.json"
+      - name: "actor-id-ca-pool"
+        projected:
+          sources:
+          - secret:
+              name: "actor-id-ca-pool"
+              items:
+              - key: "pool"
+                path: "pool.json"
+      - name: "authentication-config"
+        configMap:
+          name: "ate-api-authentication"
+      - name: "postgres-server-ca"
+        secret:
+          secretName: "postgres-server-ca"
+          optional: true
+---
+# Allow voluntary disruptions (node drains, cluster upgrades) to take
+# at most one API server pod at a time, at any replica count.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ate-api-server
+  namespace: ate-system
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: ate-api-server
+---
+# 6. Expose the Actor Assigner
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: ate-system
+spec:
+  # Headless (i.e. `clusterIP: None`) services make DNS return one A record per
+  # ready pod so gRPC clients can load balance client-side.
+  clusterIP: None
+  # Prefer, not Require: Require fails Service creation on a single-stack cluster.
+  ipFamilyPolicy: PreferDualStack
+  selector:
+    app: ate-api-server
+  ports:
+  - name: grpc
+    protocol: TCP
+    port: 443
+    targetPort: 443

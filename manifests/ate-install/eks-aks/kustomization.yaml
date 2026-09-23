@@ -1,0 +1,46 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# For a fully-managed Kubernetes control plane (e.g. AWS EKS, Azure AKS)
+# where the alpha PodCertificateRequest and ClusterTrustBundle APIs are
+# unavailable (their feature gates are not exposed to customers). See
+# docs/dev/eks-aks-workaround.md for why, and cmd/podcertcontroller's
+# tokenbroker package for what replaces them here.
+#
+# Full standalone copies of the base manifests, not a patch on top of
+# ../base: this repo's own convention for a deployment variant (see
+# ../atenet-egress-with-sdsmint.yaml next to ../atenet-egress.yaml) is a
+# complete file per variant rather than a generic Kustomize patch, since a
+# patch that reliably replaces the podCertificate/clusterTrustBundle
+# projected-volume sources across differently-ordered files needs exact
+# array indices per file and would silently break the next time anyone
+# reorders a volume or container in the base manifests.
+#
+# Mirrors ../base/kustomization.yaml's resource set exactly, minus an egress
+# gateway choice: apply eks-aks/atenet-egress.yaml or
+# eks-aks/atenet-egress-with-sdsmint.yaml alongside this, the same
+# manual choice the base install already requires.
+#
+# ate-otel-config.yaml is reused unmodified from ../ate-otel-config.yaml --
+# it carries no podCertificate/clusterTrustBundle material.
+resources:
+  - ate-api-server.yaml
+  - ate-controller.yaml
+  - atelet.yaml
+  - atenet-router.yaml
+  - pod-certificate-controller.yaml
+  - ../ate-otel-config.yaml
