@@ -223,7 +223,47 @@ func dialPortForward(ctx context.Context, kubeconfigPath, k8sContext, tokenFile 
 	}, nil
 }
 
+// serviceDNSTrustBundleConfigMapNamespace/Name/DataKey mirror
+// signercontroller.ensureTrustBundleConfigMap's naming for the servicedns
+// signer's trust bundle ConfigMap mirror -- see
+// docs/dev/eks-aks-workaround.md. Not imported from that package: it lives
+// under cmd/podcertcontroller/internal, off-limits to this package by Go's
+// internal-package visibility rules, and every other consumer of this name
+// (e.g. workerpool_apply.go, the eks-aks manifests) already hardcodes it the
+// same way rather than sharing a constant across binaries for one string.
+const (
+	serviceDNSTrustBundleConfigMapNamespace = "ate-system"
+	serviceDNSTrustBundleConfigMapName      = "servicedns.podcert.ate.dev-identity-primary-bundle"
+	serviceDNSTrustBundleConfigMapDataKey   = "trust-bundle.pem"
+)
+
 func serverTLSConfig(ctx context.Context, clientset kubernetes.Interface) (*tls.Config, error) {
+	pool, ctbErr := serviceDNSTrustPoolFromClusterTrustBundle(ctx, clientset)
+	if ctbErr != nil {
+		// ClusterTrustBundle is unavailable on managed clusters (EKS/AKS)
+		// and on any cluster where certificates.k8s.io/v1beta1 isn't served
+		// at all -- see docs/dev/eks-aks-workaround.md. podcertcontroller
+		// always mirrors the same trust bundle into a ConfigMap alongside
+		// it when that's the case, so fall back to that rather than failing
+		// outright. A genuine publishing problem on a cluster that does
+		// support ClusterTrustBundle (e.g. no live bundle found) is not
+		// treated as this kind of unavailability -- see
+		// serviceDNSTrustPoolFromClusterTrustBundle.
+		var cmErr error
+		pool, cmErr = serviceDNSTrustPoolFromConfigMap(ctx, clientset)
+		if cmErr != nil {
+			return nil, fmt.Errorf("failed to load ateapi's trust bundle from either ClusterTrustBundle (%v) or its ConfigMap mirror (%w)", ctbErr, cmErr)
+		}
+	}
+
+	return &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		RootCAs:    pool,
+		ServerName: apiServerName,
+	}, nil
+}
+
+func serviceDNSTrustPoolFromClusterTrustBundle(ctx context.Context, clientset kubernetes.Interface) (*x509.CertPool, error) {
 	ctbs, err := clientset.CertificatesV1beta1().ClusterTrustBundles().List(ctx, metav1.ListOptions{
 		LabelSelector: liveBundleSelector,
 	})
@@ -245,12 +285,23 @@ func serverTLSConfig(ctx context.Context, clientset kubernetes.Interface) (*tls.
 	if !found {
 		return nil, fmt.Errorf("no live ClusterTrustBundle found for signer %q", serviceDNSSignerName)
 	}
+	return pool, nil
+}
 
-	return &tls.Config{
-		MinVersion: tls.VersionTLS13,
-		RootCAs:    pool,
-		ServerName: apiServerName,
-	}, nil
+func serviceDNSTrustPoolFromConfigMap(ctx context.Context, clientset kubernetes.Interface) (*x509.CertPool, error) {
+	cm, err := clientset.CoreV1().ConfigMaps(serviceDNSTrustBundleConfigMapNamespace).Get(ctx, serviceDNSTrustBundleConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get trust bundle ConfigMap %q: %w", serviceDNSTrustBundleConfigMapName, err)
+	}
+	raw, ok := cm.Data[serviceDNSTrustBundleConfigMapDataKey]
+	if !ok {
+		return nil, fmt.Errorf("ConfigMap %q has no %q key", serviceDNSTrustBundleConfigMapName, serviceDNSTrustBundleConfigMapDataKey)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM([]byte(raw)) {
+		return nil, fmt.Errorf("ConfigMap %q's %q key contains no valid certificates", serviceDNSTrustBundleConfigMapName, serviceDNSTrustBundleConfigMapDataKey)
+	}
+	return pool, nil
 }
 
 // bearerTokenDialOption attaches the configured token, or mints an ate-client
