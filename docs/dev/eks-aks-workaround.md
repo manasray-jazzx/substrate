@@ -7,18 +7,22 @@ workaround. It's now implemented: `cmd/podcertcontroller/internal/tokenbroker`,
 `cmd/podcertsidecar`, `internal/identitycert`, and
 `manifests/ate-install/eks-aks/` on this branch. The design held up well
 against the real code — the shape described below is close to what shipped
-— but a handful of details turned out different once built, and three
+— but a handful of details turned out different once built, and four
 separate rounds of live testing against real clusters caught real bugs
 static review missed: two from the first pass against `podcertcontroller`
 alone (see "The sidecar" below), one from actually standing up the bundled
-Postgres (see "seven manifests" below), and four more from deploying and
+Postgres (see "seven manifests" below), four more from deploying and
 exercising the *entire* stack end to end — `atecontroller`, worker pods,
 and `atelet`, not just the identity-minting path — for the first time (see
 "Worker pods: a ninth, differently-shaped consumer" and "Three more bugs
-from full-stack live testing" below). Every one is called out explicitly
-rather than silently corrected, since the gap between "designed" and
-"built" — and between "the minting path works" and "the whole stack comes
-up" — is worth keeping visible.
+from full-stack live testing" below), and one more (plus a real,
+unresolved architectural gap, not just a bug) from actually running an
+actor through create/resume/suspend/resume once the stack was healthy (see
+"Full-stack verification: an actual actor's lifecycle" and "Remaining
+gaps" below). Every one is called out explicitly rather than silently
+corrected, since the gap between "designed" and "built" — and between "the
+minting path works," "the whole stack comes up," and "an actual workload
+runs on it" — is worth keeping visible.
 
 ## The blocker: `PodCertificateRequest` + `ClusterTrustBundle`
 
@@ -484,10 +488,79 @@ This does **not** exercise the full `ate-system` stack (no Postgres, no
 `atelet`/`ateapi`/`atenet` deployed) — those six consumers are unchanged by
 this feature (see "What stays untouched"), so the highest-value,
 highest-risk thing to verify live was the new mechanism itself, not
-Substrate's pre-existing control plane.
+Substrate's pre-existing control plane. The full stack, including an actual
+actor's lifecycle, was verified separately and manually — see the next
+section — precisely because it needed the bugs this document's later
+sections describe fixed first.
+
+### Full-stack verification: an actual actor's lifecycle
+
+Once every bug above was fixed, this branch's persistent test cluster ran
+the `counter` demo's `WorkerPool`/`ActorTemplate` (see `demos/counter/`) and
+drove an actor through `kubectl ate` directly, RPC-only (no `atenet-router`
+-- see "Remaining gaps" below for why):
+
+1. `create actor-template` → the template's **golden actor** boots on a
+   real `gvisor` worker pod, takes a `Full`-scope snapshot, and uploads it
+   to the in-cluster `rustfs` S3-compatible backend --
+   `goldenSnapshotStatus.goldenTag.name` populates once this succeeds.
+   Confirmed live: `ate-api-server`'s logs show the golden actor's full
+   `create → resume → suspend → delete` sequence completing without error.
+2. `create actor my-counter-1` → `ACTOR_STATE_SUSPENDED`, no worker
+   assigned yet (an actor starts cold, matching the golden actor's own
+   `RESUME_SOURCE_COLD_BOOT` default).
+3. `resume actor my-counter-1` → `ACTOR_STATE_RUNNING`, assigned a real
+   worker pod (`workerAssignment.workerPod`/`workerPodIp` populated) and an
+   `externalSnapshot.snapshotUri` under the actor's own prefix (not the
+   golden actor's).
+4. `suspend actor my-counter-1` → `ACTOR_STATE_SUSPENDED`, worker released
+   (`<none>` again). A fresh snapshot object confirmed to actually exist in
+   `rustfs` afterward (`aws s3 ls`, pointed at
+   `http://rustfs.ate-system.svc:9000`): real `checkpoint.img.zstd`,
+   `pages.img.zstd`, `pages_meta.img.zstd`, and `durable-dir.tar.zstd`
+   files, not just a metadata record -- a genuine gVisor process-memory
+   checkpoint round-tripped through the S3-compatible backend.
+5. `resume actor my-counter-1` again → `ACTOR_STATE_RUNNING`, landed on a
+   **different** worker pod than step 3's, proving the resume path
+   actually restores from the uploaded snapshot rather than reusing
+   in-memory state on the same worker by coincidence.
+
+This is the RPC-level half of the demo's documented lifecycle (see
+`demos/counter/README.md`) -- actor create/resume/suspend, worker
+assignment, and the snapshot round-trip through object storage, all
+confirmed against real cluster state rather than inferred. It does **not**
+cover the demo's own party trick (an HTTP request through `atenet-router`
+incrementing an in-memory counter that survives the round trip) --
+"Remaining gaps" below says why that half was left unverified, deliberately,
+rather than silently.
 
 ## Remaining gaps
 
+- **Worker pools outside podcertcontroller's `--trust-bundle-configmap-namespace`
+  cannot mint identities in token-broker mode.** Found by actually creating a
+  `WorkerPool` in its own namespace (`ate-demo-counter`, following the
+  `counter` demo's own convention) rather than reusing `ate-system`: its
+  worker pods' `podcert-sidecar-podidentity` init container failed
+  `FailedMount` forever -- `configmap "podidentity.podcert.ate.dev-identity-primary-bundle"
+  not found` -- because `ConfigMap` is a **namespaced** resource, unlike the
+  `ClusterTrustBundle` it replaces, which is cluster-scoped by design
+  specifically so any namespace can reference it without a cross-namespace
+  read. `podcertcontroller` only ever publishes its ConfigMap mirror into
+  one namespace (`ate-system` in the `eks-aks` manifests), so this is not a
+  corner case -- it is the default outcome for any `WorkerPool` outside that
+  one namespace, which is most real installs' natural shape (a
+  `WorkerPool`/atespace per team or workload, not everything crammed into
+  the control plane's own namespace). Worked around for this session's live
+  test by placing the demo's `WorkerPool` in `ate-system` instead of its own
+  namespace (`workerpool_apply.go`'s scheduling is label-selector-only, with
+  no coupling between a pool's k8s namespace and its atespace, so this is a
+  safe substitution for testing, not a real fix). A real fix needs a
+  namespace-aware mirror: either `atecontroller` (which already knows every
+  `WorkerPool`'s namespace) copies the two ate-system-published trust-bundle
+  ConfigMaps into each `WorkerPool`'s namespace and keeps them in sync, or
+  `podcertcontroller` is told the target namespace list instead of a single
+  namespace. Not attempted here -- it is a real feature, not a one-line fix,
+  and deserves its own design pass rather than a rushed addition mid-test.
 - **The `ServiceAccountTokenPodNodeInfo` extras probe was never run against
   a real cluster.** `Verifier.checkBoundObjectExtras` treats
   `status.user.extra`'s bound-object keys as optional hardening, exactly
@@ -511,3 +584,41 @@ Substrate's pre-existing control plane.
   `manifests/ate-install/eks-aks/`'s `kustomize build` output manually, the
   same manual choice the base install already requires for picking an
   egress variant.
+- **`atenet-router` was never deployed in this round of testing.** The actor
+  lifecycle verification below (create/resume/suspend/resume) drives
+  `kubectl ate`'s RPCs directly against `ate-api-server`, which is enough to
+  exercise worker assignment and the snapshot round-trip through object
+  storage, but not the counter demo's actual HTTP-triggered activation path
+  (`atunnel`'s ingress listeners are mTLS-restricted to a specific client
+  identity, almost certainly `atenet-router`'s own, so a plain in-cluster
+  curl can't stand in for it the way the RPC path can). `atenet-router`'s
+  `eks-aks` manifest carries its own two `podcertsidecar` init containers
+  and an Envoy/agentgateway dataplane bootstrap, neither exercised by
+  anything in this document -- treat it as unverified until someone
+  actually deploys it here.
+- **Reproducing the live cluster this document's testing ran against needs
+  state this repo does not track.** Three things were created directly on
+  the cluster, not committed anywhere:
+  - A local image registry (`hack/create-kind-cluster.sh`'s `kind-registry`
+    container on `localhost:5001`, wired into the node's containerd config)
+    -- needed because `ateapi` requires every `ActorTemplate` container
+    image to be digest-pinned (`name@sha256:...`), which `ko`'s `kind.local`
+    direct-load path (used for the Deployment images throughout this
+    document) does not produce; only a real registry push does. A cluster
+    created directly with `hack/create-kind-cluster.sh` gets this for free.
+  - `atelet-devtest`'s `--localhost-registry-replacement=kind-registry:5000`
+    flag (patched onto the live DaemonSet, not committed to
+    `manifests/ate-install/eks-aks/atelet.yaml`): `atelet`'s own image-fetch
+    client (`internal/imagecache`, independent of containerd/kubelet's own
+    pulls) resolves a digest-pinned `localhost:5001/...` reference from
+    inside its own pod's network namespace, where "localhost" is the pod
+    itself, not the registry container -- this flag rewrites it to the
+    cluster-DNS-resolvable name. `manifests/ate-install/kind/atelet/kustomization.yaml`
+    already carries the same flag for exactly this reason; it was not added
+    to the `eks-aks` manifest because it is a local-testing artifact with no
+    meaning on a real EKS/AKS cluster, not part of the workaround itself.
+  - The `atelet-envvars`/`atelet-secret-envvars` ConfigMap/Secret (see
+    "Three more bugs from full-stack live testing" above) that point
+    `atelet` at the in-cluster `rustfs` S3-compatible backend instead of
+    GCS -- deliberately per-deployment, per that section's reasoning, but
+    that means the exact values used here exist only on this cluster.
