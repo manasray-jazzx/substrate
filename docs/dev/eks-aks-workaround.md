@@ -642,20 +642,46 @@ integration this whole document exists to enable:
    `--substrate-ate-api-insecure`; confirmed this alone was sufficient --
    the controller reached `1/1 Ready` and its logged config showed
    `Insecure: true` with no further dial errors.
-2. **kagent's controller also registers a controller-runtime `source.Kind`
-   watch for `ActorTemplate` as a Kubernetes CRD** (alongside its own real
-   CRDs like `AgentHarness`/`SandboxAgent`), logging `"if kind is a CRD, it
-   should be installed before calling Start" ... "no matches for kind
-   \"ActorTemplate\" in version \"ate.dev/v1alpha1\""` on a permanent retry
-   loop. `ActorTemplate` is deliberately **not** a Kubernetes CRD in Agent
-   Substrate (see `demos/counter/README.md`: "the actor template is a
-   Substrate `ActorTemplate` resource ... managed through the ate API,"
-   never a `kubectl apply`-able object) -- this looks like a mismatch
-   between what kagent's controller-runtime scaffolding still assumes and
-   what the real `controller.substrate` integration actually talks to
-   (the gRPC API, per finding 1 above). Non-fatal -- the watch registration
-   fails and retries in the background without blocking startup -- but
-   worth kagent's own attention.
+2. **kagent depends on a fork of Agent Substrate that adds a Kubernetes-CRD
+   `ActorTemplate` type this upstream branch deliberately does not have --
+   and creating a `SandboxAgent` crashes the whole controller because of
+   it.** `go/go.mod`'s `replace github.com/agent-substrate/substrate =>
+   github.com/kagent-dev/substrate v0.0.9` is the root cause: kagent v0.10.2
+   is built against `kagent-dev/substrate`, not
+   `github.com/agent-substrate/substrate` (this repo), and that fork
+   apparently models `ActorTemplate` as *both* a Kubernetes CRD and a
+   gRPC/Postgres-backed resource -- `pkg/sandboxbackend/substrate`'s
+   `reconcileActorTemplate`/`buildSandboxAgentActorTemplate` literally
+   `client.Create()` an `atev1alpha1.ActorTemplate` Kubernetes object.
+   Substrate (this repo) deliberately does **not** have such a CRD --
+   see `demos/counter/README.md`: "the actor template is a Substrate
+   `ActorTemplate` resource ... managed through the ate API," never a
+   `kubectl apply`-able object -- and upstream is presently discussing
+   *removing* complexity from `ActorTemplate`'s lifecycle
+   (`agent-substrate/substrate` issue #536), not adding a CRD mirror of it.
+   At rest this only produces a background, non-fatal "no matches for
+   kind" retry (as first observed and described, incompletely, in an
+   earlier revision of this section). **Confirmed live that it is not
+   actually harmless**: creating a single minimal `SandboxAgent` (pointed
+   at the `counter` WorkerPool from "Full-stack verification" above) was
+   enough to crash the entire `kagent-controller` process --
+   `"problem running manager": "failed to wait for sandboxagent caches to
+   sync kind source: *v1alpha1.ActorTemplate: timed out waiting for cache
+   to be synced"` -- the same class of bug as the `egressmitmtrust`/
+   `atecontroller` crash-loop fixed earlier in this document: one
+   controller's cache-sync failure takes down controller-runtime's whole
+   manager, not just that one controller. This is a **hard, structural
+   blocker**, not a cosmetic one: `SandboxAgent` (and, by the same
+   mechanism, `AgentHarness`) cannot create a working Substrate actor
+   against this branch, or against any `agent-substrate/substrate`
+   install that isn't `kagent-dev/substrate`'s fork specifically, no
+   matter how the TLS issue above is resolved. Closing this gap for real
+   would mean either running kagent against its own vendored `substrate`
+   Helm subchart (its actual supported configuration, which installs
+   `kagent-dev/substrate`'s stack instead of this branch's) or adding a
+   CRD-backed `ActorTemplate` mirror to this repo -- a real design
+   decision (and one upstream's own #536 discussion cuts against), not a
+   live patch, and out of scope for this document to decide unilaterally.
 
 Neither finding is this branch's to fix; both are reported here because
 they were found using this branch's own live cluster and block the exact
