@@ -1,0 +1,384 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# 1. Create Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: atelet
+  namespace: ate-system
+---
+# 2. Define Permissions
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: atelet
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["ate.dev"]
+  resources: ["csidriverconfigs"]
+  verbs: ["get", "list", "watch"]
+# SandboxConfigs are watched to pre-download sandbox assets into the node's
+# cache before the first actor needs them (see cmd/atelet/sandbox_prewarm.go).
+- apiGroups: ["ate.dev"]
+  resources: ["sandboxconfigs"]
+  verbs: ["get", "list", "watch"]
+# ClusterTrustBundles referenced by SystemInfo trustBundle data sources are
+# resolved on the node: atelet reads them through an informer and projects
+# the sanitized PEM into actors (see cmd/atelet/trustbundle.go).
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["clustertrustbundles"]
+  verbs: ["get", "watch", "list"]
+---
+# 3. Bind Identity to Permissions
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: atelet
+subjects:
+- kind: ServiceAccount
+  name: atelet
+  namespace: ate-system
+roleRef:
+  kind: ClusterRole
+  name: atelet
+  apiGroup: rbac.authorization.k8s.io
+---
+# 4. Namespaced Role for EndpointSlices
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: atelet-endpointslices
+  namespace: ate-system
+rules:
+- apiGroups: ["discovery.k8s.io"]
+  resources: ["endpointslices"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: atelet-endpointslices
+  namespace: ate-system
+subjects:
+- kind: ServiceAccount
+  name: atelet
+  namespace: ate-system
+roleRef:
+  kind: Role
+  name: atelet-endpointslices
+  apiGroup: rbac.authorization.k8s.io
+---
+# 5. Create PriorityClass
+# Prioritize atelet over workers, which need it for actor activation.
+# Use the highest user-defined priority; system-node-critical requires kube-system.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ate-node-critical
+value: 1000000000
+globalDefault: false
+description: "Node-local ate components that every actor activation depends on."
+
+---
+# 6. Create DaemonSet
+#
+# ${SUBSTRATE_VERSION} and ${SUBSTRATE_VERSION_SUFFIX} are placeholders that
+# hack/install-ate.sh fills in after kustomize/ko.
+#
+# During a rolling upgrade both old/new version DaemonSets coexist, each pinned 
+# to nodes carrying a version label while the operator flip nodes from old version
+# label to new versio label one at a time.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: atelet-${SUBSTRATE_VERSION_SUFFIX}
+  namespace: ate-system
+  labels:
+    app: atelet
+    ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+spec:
+  selector:
+    matchLabels:
+      app: atelet
+      ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+  template:
+    metadata:
+      labels:
+        app: atelet
+        ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: atelet
+      priorityClassName: ate-node-critical
+      # Pin to nodes labelled with this substrate version. install-ate.sh labels unlabeled
+      # nodes at install time; the operator owns the label afterwards.
+      nodeSelector:
+        ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+      # Budget for the full shutdown sequence: --drain-delay (0 for atelet) +
+      # --drain-timeout (5m). Sized long because Checkpoint/Restore stream
+      # multi-GiB snapshots and must not be force-cancelled mid-upload. The sum
+      # must fit within terminationGracePeriodSeconds, plus slack for the force
+      # Stop() and the tracer/meter flush on exit.
+      terminationGracePeriodSeconds: 330
+      # atelet must run on every node a WorkerPool actor may schedule to.
+      # Microvm pools are tainted ate.dev/sandboxClass=<class>:NoSchedule per
+      # the convention in cmd/atecontroller/internal/controllers/workerpool_apply.go
+      # (which also adds the matching toleration to ateom worker pods).
+      # Tolerating the key with operator: Exists covers any current or future
+      # sandbox class value without needing another manifest edit.
+      tolerations:
+      - key: ate.dev/sandboxClass
+        operator: Exists
+        effect: NoSchedule
+      # Managed-cluster path: PodCertificateRequest is unavailable, so this
+      # mints atelet's podidentity certificate from podcertcontroller's
+      # PodCertificateBroker RPC instead of a kubelet-managed podCertificate
+      # volume. Native sidecar (restartPolicy: Always) so it mints before
+      # atelet starts (gated by the startupProbe below) and keeps refreshing
+      # for the pod's lifetime.
+      initContainers:
+      - name: podcert-sidecar-podidentity
+        image: ko://github.com/agent-substrate/substrate/cmd/podcertsidecar
+        restartPolicy: Always
+        args:
+        - --purpose=podidentity
+        - --broker-address=podcertificate-controller.podcertificate-controller-system.svc:8443
+        - --token-path=/var/run/secrets/podcert.ate.dev/podidentity/token
+        # The broker's own listener presents a servicedns-purpose serving
+        # certificate (see cmd/podcertcontroller/tokenmint.go), regardless of
+        # which purpose this sidecar is minting -- so this is always the
+        # servicedns trust bundle, never the podidentity one.
+        - --trust-bundle-path=/run/servicedns.podcert.ate.dev/trust-bundle.pem
+        - --credential-bundle-path=/run/podidentity.podcert.ate.dev/credential-bundle.pem
+        - --pod-name=$(POD_NAME)
+        - --pod-uid=$(POD_UID)
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        volumeMounts:
+        - name: podidentity-token
+          mountPath: /var/run/secrets/podcert.ate.dev/podidentity
+          readOnly: true
+        - name: servicedns-ca
+          mountPath: /run/servicedns.podcert.ate.dev
+          readOnly: true
+        - name: podidentity
+          mountPath: /run/podidentity.podcert.ate.dev
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        startupProbe:
+          exec:
+            command: ["/ko-app/podcertsidecar", "--check-file=/run/podidentity.podcert.ate.dev/credential-bundle.pem"]
+          periodSeconds: 1
+          failureThreshold: 60
+      containers:
+      - name: atelet
+        image: ko://github.com/agent-substrate/substrate/cmd/atelet
+        args:
+        # Unlike the base manifest, this is off: GCP application default
+        # credentials assume a GKE node's metadata server, which a managed
+        # non-GCP cluster (EKS/AKS) has no equivalent of. Worker images are
+        # expected to come from a registry that does not need it.
+        - --gcp-auth-for-image-pulls=false
+        - --grpc-server-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem
+        - --client-ca-certs=/run/podidentity-ca/trust-bundle.pem
+        - --ateapi-ca-file=/run/servicedns.podcert.ate.dev/trust-bundle.pem
+        # Graceful shutdown knobs. The sum must fit within
+        # terminationGracePeriodSeconds above.
+        - --drain-delay=0s
+        - --drain-timeout=5m
+        # atelet does no mounts, netlink, device, or namespace operations (those
+        # live in the ateom worker pod) — it only reads/writes the
+        # /var/lib/ateom-gvisor hostPath as root, so it needs no Linux
+        # capabilities. (Unpacking arbitrary actor images can require writing into
+        # image-defined read-only dirs; the untar in cmd/atelet/oci.go extracts
+        # directories writable then restores the image's modes, and removal makes
+        # them writable again first, so root suffices without CAP_DAC_OVERRIDE.)
+        # runAsUser is pinned explicitly rather than relying on the base image's
+        # default user.
+        securityContext:
+          runAsUser: 0
+          runAsGroup: 0
+          capabilities:
+            drop:
+            - ALL
+        # Keep per-node reservations small; omit limits to allow usage to grow
+        # with the number of hosted actors.
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: OTEL_RESOURCE_ATTRIBUTES
+          value: k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.pod.uid=$(POD_UID),k8s.node.name=$(NODE_NAME),service.instance.id=$(POD_UID)
+        # Unlike the base manifest, ATE_STORAGE_BACKEND is not set to "gcs"
+        # here: GCS application default credentials assume a GKE node's
+        # metadata server, which a managed non-GCP cluster (EKS/AKS) has no
+        # equivalent of, and atelet creates its storage client eagerly at
+        # startup (cmd/atelet/main.go), so a bad default would crash-loop it
+        # immediately rather than only failing the operations that use it.
+        # It comes instead from the per-developer/per-deployment ConfigMap
+        # and Secret below, in whatever shape that cluster's real backend
+        # needs -- see manifests/ate-install/kind/atelet/kustomization.yaml
+        # for the env vars an "s3" backend needs, as one example.
+        #
+        # OTLP exporter settings are shared by every control plane component;
+        # see manifests/ate-install/ate-otel-config.yaml. Listed first so the
+        # per-developer ConfigMap/Secret below can still override a key.
+        envFrom:
+        - configMapRef:
+            name: ate-otel-config
+        - configMapRef:
+            name: atelet-envvars
+            optional: true
+        - secretRef:
+            name: atelet-secret-envvars
+            optional: true
+        ports:
+        - name: grpc
+          containerPort: 8085
+          hostPort: 8085
+        - name: prometheus
+          containerPort: 9090
+          hostPort: 9090
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 9090
+          initialDelaySeconds: 5
+          periodSeconds: 2
+          failureThreshold: 3
+        # /healthz stays 200 while a terminating pod drains; /readyz turns 503,
+        # so liveness and readiness diverge correctly during shutdown.
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 9090
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        volumeMounts:
+        - name: run-ateom
+          mountPath: /var/lib/ateom-gvisor
+        - name: podidentity
+          mountPath: /run/podidentity.podcert.ate.dev
+        - name: podidentity-ca
+          mountPath: /run/podidentity-ca
+          readOnly: true
+        - name: servicedns-ca
+          mountPath: /run/servicedns.podcert.ate.dev
+          readOnly: true
+        - name: kubelet-plugins
+          mountPath: /var/lib/kubelet/plugins
+        - name: device-plugins
+          mountPath: /var/lib/kubelet/device-plugins
+        - name: host-dev
+          mountPath: /host/dev
+          readOnly: true
+      volumes:
+      - name: run-ateom
+        hostPath:
+          path: /var/lib/ateom-gvisor
+          type: DirectoryOrCreate
+      # Mount Kubelet plugins directory to access CSI driver Unix domain sockets.
+      - name: kubelet-plugins
+        hostPath:
+          path: /var/lib/kubelet/plugins
+          type: DirectoryOrCreate
+      # atelet advertises host devices (e.g. /dev/kvm) to kubelet as extended
+      # resources so worker pods can be granted just those devices instead of
+      # running privileged. Registering requires talking to kubelet's socket in
+      # this directory and creating a plugin socket beside it.
+      - name: device-plugins
+        hostPath:
+          path: /var/lib/kubelet/device-plugins
+          type: DirectoryOrCreate
+      # Read-only view of the node's device nodes, used only to detect which
+      # ones exist (atelet's own /dev is the container's, and does not show
+      # /dev/kvm). Detection is all this grants: atelet drops every capability
+      # and its own cgroup device filter still denies opening these.
+      - name: host-dev
+        hostPath:
+          path: /dev
+          type: Directory
+      # Identity for mutual TLS with the ate-apiserver, minted by the
+      # podcert-sidecar-podidentity init container above rather than a
+      # kubelet-managed podCertificate volume (unavailable on this cluster).
+      # Writable so the sidecar can write credential-bundle.pem into it; the
+      # atelet container only ever reads from it.
+      - name: podidentity
+        emptyDir:
+          medium: Memory
+      # Trust anchors for verifying podidentity certificates, from
+      # podcertcontroller's ConfigMap mirror of the podidentity
+      # ClusterTrustBundle (unavailable on this cluster).
+      - name: podidentity-ca
+        projected:
+          sources:
+          - configMap:
+              name: podidentity.podcert.ate.dev-identity-primary-bundle
+              items:
+              - key: trust-bundle.pem
+                path: trust-bundle.pem
+      # Bound token the sidecar presents to podcertcontroller's
+      # PodCertificateBroker RPC to authenticate as this pod.
+      - name: podidentity-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              audience: podcertcontroller.ate.dev
+              expirationSeconds: 3600
+              path: token
+      - name: servicedns-ca
+        projected:
+          sources:
+          - configMap:
+              name: servicedns.podcert.ate.dev-identity-primary-bundle
+              items:
+              - key: trust-bundle.pem
+                path: trust-bundle.pem

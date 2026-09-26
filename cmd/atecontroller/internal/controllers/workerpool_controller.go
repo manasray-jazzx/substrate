@@ -52,6 +52,18 @@ type WorkerPoolReconciler struct {
 	// OTelTracesSamplerArg is the OTEL_TRACES_SAMPLER_ARG propagated to ateom
 	// pods. Ignored unless OTelTracesSampler is set.
 	OTelTracesSamplerArg string
+	// WorkerTokenBrokerAddress, when set, provisions every worker pod's
+	// atunnel certificates via podcertcontroller's PodCertificateBroker RPC
+	// at this address instead of PodCertificateRequest. Empty (the default)
+	// keeps the existing PodCertificateRequest-based volumes. See
+	// docs/dev/eks-aks-workaround.md.
+	WorkerTokenBrokerAddress string
+	// WorkerTokenBrokerSidecarImage is the podcert-sidecar-podidentity init
+	// container's image reference, used when WorkerTokenBrokerAddress is
+	// set. It must already be a resolved image reference (not a `ko://`
+	// string): this controller's own binary is never processed by `ko
+	// resolve`, unlike the static manifest that supplies this value.
+	WorkerTokenBrokerSidecarImage string
 
 	desiredWorkers metric.Int64ObservableUpDownCounter
 	readyWorkers   metric.Int64ObservableUpDownCounter
@@ -116,6 +128,9 @@ func (r *WorkerPoolReconciler) applyDeployment(ctx context.Context, wp *atev1alp
 		MetricExportTimeout:  r.OTelMetricExportTimeout,
 		TracesSampler:        r.OTelTracesSampler,
 		TracesSamplerArg:     r.OTelTracesSamplerArg,
+	}, tokenBrokerSettings{
+		Address:      r.WorkerTokenBrokerAddress,
+		SidecarImage: r.WorkerTokenBrokerSidecarImage,
 	})
 	if err := r.Apply(ctx, depAC, client.FieldOwner(workerPoolFieldOwner), client.ForceOwnership); err != nil {
 		return fmt.Errorf("failed to apply Deployment: %w", err)

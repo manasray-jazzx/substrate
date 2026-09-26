@@ -1,0 +1,234 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+kind: Namespace
+apiVersion: v1
+metadata:
+  name: ate-system
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ate-client
+  namespace: ate-system
+  labels:
+    apps: ate-client
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ate-controller
+  namespace: ate-system
+  labels:
+    apps: ate-controller
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ate-controller
+subjects:
+- kind: ServiceAccount
+  name: ate-controller
+  namespace: ate-system
+roleRef:
+  kind: ClusterRole
+  name: ate-controller
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ate-controller
+  namespace: ate-system
+subjects:
+- kind: ServiceAccount
+  name: ate-controller
+  namespace: ate-system
+roleRef:
+  kind: Role
+  name: ate-controller
+  apiGroup: rbac.authorization.k8s.io
+
+---
+
+kind: Service
+apiVersion: v1
+metadata:
+  name: ate-controller
+  namespace: ate-system
+  labels:
+    app: ate-controller
+spec:
+  selector:
+    app: ate-controller
+  ports:
+  - name: metrics
+    port: 8080
+    targetPort: metrics
+    protocol: TCP
+
+---
+
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: ate-controller
+  namespace: ate-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ate-controller
+  template:
+    metadata:
+      labels:
+        app: ate-controller
+    spec:
+      serviceAccountName: ate-controller
+      # Managed-cluster path: PodCertificateRequest is unavailable, so this
+      # mints ate-controller's podidentity certificate from
+      # podcertcontroller's PodCertificateBroker RPC instead of a
+      # kubelet-managed podCertificate volume.
+      initContainers:
+      - name: podcert-sidecar-podidentity
+        image: ko://github.com/agent-substrate/substrate/cmd/podcertsidecar
+        restartPolicy: Always
+        args:
+        - --purpose=podidentity
+        - --broker-address=podcertificate-controller.podcertificate-controller-system.svc:8443
+        - --token-path=/var/run/secrets/podcert.ate.dev/podidentity/token
+        # The broker's own listener presents a servicedns-purpose serving
+        # certificate (see cmd/podcertcontroller/tokenmint.go), regardless of
+        # which purpose this sidecar is minting.
+        - --trust-bundle-path=/run/servicedns-ca/trust-bundle.pem
+        - --credential-bundle-path=/run/podidentity.podcert.ate.dev/credential-bundle.pem
+        - --pod-name=$(POD_NAME)
+        - --pod-uid=$(POD_UID)
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        volumeMounts:
+        - name: podidentity-token
+          mountPath: /var/run/secrets/podcert.ate.dev/podidentity
+          readOnly: true
+        - name: servicedns-ca
+          mountPath: /run/servicedns-ca
+          readOnly: true
+        - name: podidentity
+          mountPath: /run/podidentity.podcert.ate.dev
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        startupProbe:
+          exec:
+            command: ["/ko-app/podcertsidecar", "--check-file=/run/podidentity.podcert.ate.dev/credential-bundle.pem"]
+          periodSeconds: 1
+          failureThreshold: 60
+      containers:
+      - name: ate-controller
+        image: ko://github.com/agent-substrate/substrate/cmd/atecontroller
+        args:
+        - --ateapi-ca-file=/run/servicedns-ca/trust-bundle.pem
+        - --ateapi-client-cert=/run/podidentity.podcert.ate.dev/credential-bundle.pem
+        # Every worker pod atecontroller creates is, functionally, another
+        # PodCertificateRequest consumer (atunnel's own identity inside
+        # ateom) -- unavailable on this cluster, so worker pods mint through
+        # podcertcontroller's broker RPC too. See
+        # cmd/atecontroller/internal/controllers/workerpool_apply.go and
+        # docs/dev/eks-aks-workaround.md.
+        - --worker-token-broker-address=podcertificate-controller.podcertificate-controller-system.svc:8443
+        # ko resolve only rewrites a ko:// reference when it is a whole
+        # scalar value in the YAML tree, not a substring of a larger one --
+        # so the flag and its value are two separate args, unlike the
+        # --flag=value form used elsewhere in this file. This is what lets
+        # this static manifest hand atecontroller's own running Go code (see
+        # workerpool_apply.go's tokenBrokerSettings) an already-resolved
+        # image reference, since that code is never itself processed by ko.
+        - --worker-token-broker-sidecar-image
+        - ko://github.com/agent-substrate/substrate/cmd/podcertsidecar
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: OTEL_RESOURCE_ATTRIBUTES
+          value: k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.pod.uid=$(POD_UID),service.instance.id=$(POD_UID)
+        # OTLP exporter settings are shared by every control plane component;
+        # see manifests/ate-install/ate-otel-config.yaml. The controller also
+        # propagates these to the ateom worker pods it creates.
+        envFrom:
+        - configMapRef:
+            name: ate-otel-config
+        ports:
+        - name: metrics
+          containerPort: 8080
+          protocol: TCP
+        - name: healthz
+          containerPort: 8081
+          protocol: TCP
+        volumeMounts:
+        # Controller's own client identity presented to ateapi.
+        - name: "podidentity"
+          mountPath: "/run/podidentity.podcert.ate.dev"
+        # Trust bundle used to verify ateapi's servicedns serving cert.
+        - name: "servicedns-ca"
+          mountPath: "/run/servicedns-ca"
+      volumes:
+      # Minted by the podcert-sidecar-podidentity init container above rather
+      # than a kubelet-managed podCertificate volume (unavailable on this
+      # cluster). Writable so the sidecar can write credential-bundle.pem
+      # into it; the ate-controller container only ever reads from it.
+      - name: "podidentity"
+        emptyDir:
+          medium: Memory
+      # Bound token the sidecar presents to podcertcontroller's
+      # PodCertificateBroker RPC to authenticate as this pod.
+      - name: "podidentity-token"
+        projected:
+          sources:
+          - serviceAccountToken:
+              audience: podcertcontroller.ate.dev
+              expirationSeconds: 3600
+              path: token
+      - name: "servicedns-ca"
+        projected:
+          sources:
+          - configMap:
+              name: servicedns.podcert.ate.dev-identity-primary-bundle
+              items:
+              - key: trust-bundle.pem
+                path: trust-bundle.pem

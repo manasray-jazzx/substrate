@@ -20,11 +20,14 @@
 package credbundle
 
 import (
+	"bytes"
+	"crypto"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -204,6 +207,66 @@ func Parse(bundlePath string) (*tls.Certificate, error) {
 		Leaf:        leafCert,
 		PrivateKey:  leafKey,
 	}, nil
+}
+
+// Write encodes privateKey and certChainDER (leaf first, intermediates after)
+// into the same format Parse reads: a PRIVATE KEY block followed by
+// CERTIFICATE blocks, leaf-to-root. It writes to a temporary file in path's
+// directory and renames it into place, so a concurrent reader (Loader's
+// certCache, or another process) never observes a partially written bundle.
+func Write(path string, privateKey crypto.PrivateKey, certChainDER [][]byte) error {
+	keyBytes, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		return fmt.Errorf("while marshaling private key: %w", err)
+	}
+
+	buf := &bytes.Buffer{}
+	if err := pem.Encode(buf, &pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes}); err != nil {
+		return fmt.Errorf("while encoding private key: %w", err)
+	}
+	for _, certDER := range certChainDER {
+		if err := pem.Encode(buf, &pem.Block{Type: "CERTIFICATE", Bytes: certDER}); err != nil {
+			return fmt.Errorf("while encoding certificate: %w", err)
+		}
+	}
+
+	return writeFileAtomic(path, buf.Bytes())
+}
+
+// writeFileAtomic writes data to a temp file alongside path and renames it
+// into place, so path is never observed in a partially written state.
+func writeFileAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("while creating temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // no-op once the rename below succeeds
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("while writing temp file: %w", err)
+	}
+	// 0640, not 0600: a consumer that runs as a different, non-root UID from
+	// whatever wrote this file (e.g. postgres.yaml's postgres container,
+	// sharing a pod-level fsGroup with its tls-reloader sidecar rather than
+	// running as the same user) can only read it via the fsGroup-granted
+	// group bit. This matches what kubelet's own podCertificate mechanism
+	// produces in practice for an fsGroup-using pod -- see the comment on
+	// postgres.yaml's servicedns volume ("0600 plus the group read that
+	// fsGroup adds is the 0640 above") -- kubelet's declared mode is 0600
+	// but fsGroup's group-read grant is layered on top of it regardless.
+	if err := tmp.Chmod(0o640); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("while setting temp file permissions: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("while closing temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("while renaming temp file into place: %w", err)
+	}
+	return nil
 }
 
 // ParsePool reads a PEM trust-bundle file into an *x509.CertPool. It returns an

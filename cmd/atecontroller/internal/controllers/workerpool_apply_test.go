@@ -207,7 +207,7 @@ func TestBuildDeploymentApplyConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildDeploymentApplyConfig(tt.wp, ateomOTelSettings{})
+			got := buildDeploymentApplyConfig(tt.wp, ateomOTelSettings{}, tokenBrokerSettings{})
 			if diff := cmp.Diff(tt.want, got); diff != "" {
 				t.Fatalf("buildDeploymentApplyConfig() mismatch (-want +got):\n%s", diff)
 			}
@@ -227,7 +227,7 @@ func TestBuildDeploymentApplyConfigMetadata(t *testing.T) {
 		},
 	})
 
-	got := buildDeploymentApplyConfig(wp, ateomOTelSettings{})
+	got := buildDeploymentApplyConfig(wp, ateomOTelSettings{}, tokenBrokerSettings{})
 	wantLabels := map[string]string{
 		"project":             "agent-substrate",
 		"team":                "compute",
@@ -269,7 +269,7 @@ func TestMicroVMPodShape(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			wp := testWorkerPoolApplyConfig(nil)
 			wp.Spec.SandboxClass = tt.class
-			ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}).Spec.Template.Spec
+			ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}, tokenBrokerSettings{}).Spec.Template.Spec
 
 			// /dev/kvm must come from the device plugin, never a hostPath: a
 			// hostPath mount carries no cgroup device allow rule, and the
@@ -362,7 +362,7 @@ func TestMicroVMDeviceRequestsPreserveTemplateResources(t *testing.T) {
 		},
 	})
 	wp.Spec.SandboxClass = atev1alpha1.SandboxClassMicroVM
-	c := buildDeploymentApplyConfig(wp, ateomOTelSettings{}).Spec.Template.Spec.Containers[0]
+	c := buildDeploymentApplyConfig(wp, ateomOTelSettings{}, tokenBrokerSettings{}).Spec.Template.Spec.Containers[0]
 
 	if got, ok := deviceLimit(c, string(corev1.ResourceMemory)); !ok || got != "2Gi" {
 		t.Errorf("memory limit = %q (present=%v), want 2Gi", got, ok)
@@ -427,7 +427,7 @@ func TestAteomSecurityContextByClass(t *testing.T) {
 // TestTerminationGracePeriodSeconds asserts the pod's grace period is hardcoded to 3600s.
 func TestTerminationGracePeriodSeconds(t *testing.T) {
 	wp := testWorkerPoolApplyConfig(nil)
-	ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}).Spec.Template.Spec
+	ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}, tokenBrokerSettings{}).Spec.Template.Spec
 	if ps.TerminationGracePeriodSeconds == nil {
 		t.Fatalf("TerminationGracePeriodSeconds not set")
 	}
@@ -441,7 +441,7 @@ func TestTerminationGracePeriodSeconds(t *testing.T) {
 // actors' drain window.
 func TestRolloutStrategy(t *testing.T) {
 	wp := testWorkerPoolApplyConfig(nil)
-	spec := buildDeploymentApplyConfig(wp, ateomOTelSettings{}).Spec
+	spec := buildDeploymentApplyConfig(wp, ateomOTelSettings{}, tokenBrokerSettings{}).Spec
 	if spec.Strategy == nil || spec.Strategy.RollingUpdate == nil {
 		t.Fatalf("Strategy.RollingUpdate not set")
 	}
@@ -475,7 +475,7 @@ func TestBuildDeploymentApplyConfigOTelEndpoint(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), ateomOTelSettings{Endpoint: tt.endpoint}).
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), ateomOTelSettings{Endpoint: tt.endpoint}, tokenBrokerSettings{}).
 				Spec.Template.Spec.Containers[0]
 			env := envByName(c.Env)
 
@@ -561,7 +561,7 @@ func TestBuildDeploymentApplyConfigMetricExportTuning(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel).
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, tokenBrokerSettings{}).
 				Spec.Template.Spec.Containers[0]
 			env := envByName(c.Env)
 			for _, k := range []string{"OTEL_METRIC_EXPORT_INTERVAL", "OTEL_METRIC_EXPORT_TIMEOUT"} {
@@ -618,7 +618,7 @@ func TestBuildDeploymentApplyConfigTracesSamplerPropagation(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel).
+			c := buildDeploymentApplyConfig(testWorkerPoolApplyConfig(nil), tt.otel, tokenBrokerSettings{}).
 				Spec.Template.Spec.Containers[0]
 			env := envByName(c.Env)
 			for _, k := range []string{"OTEL_TRACES_SAMPLER", "OTEL_TRACES_SAMPLER_ARG"} {
@@ -841,4 +841,139 @@ func expectedDeploymentApplyConfig(mutatePodSpec func(*corev1ac.PodSpecApplyConf
 			WithTemplate(corev1ac.PodTemplateSpec().
 				WithLabels(map[string]string{"ate.dev/worker-pool": wp.Name}).
 				WithSpec(podSpecAC)))
+}
+
+// TestTokenBrokerModeReplacesPodCertificateRequestVolumes covers the
+// managed-cluster path (tokenBrokerAddress set): atunnel's identity volume
+// becomes a writable emptyDir a new init container mints into, its trust
+// bundle moves to a separate ConfigMap-sourced volume, and the egress trust
+// volume switches from clusterTrustBundle to configMap -- see
+// docs/dev/eks-aks-workaround.md.
+func TestTokenBrokerModeReplacesPodCertificateRequestVolumes(t *testing.T) {
+	wp := testWorkerPoolApplyConfig(nil)
+	ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}, tokenBrokerSettings{
+		Address:      "podcertificate-controller.podcertificate-controller-system.svc:8443",
+		SidecarImage: "example.com/podcertsidecar:test",
+	}).Spec.Template.Spec
+
+	volumes := map[string]corev1ac.VolumeApplyConfiguration{}
+	for _, v := range ps.Volumes {
+		volumes[*v.Name] = v
+	}
+
+	identity, ok := volumes[atunnelIdentityVolume]
+	if !ok {
+		t.Fatalf("volume %q not found", atunnelIdentityVolume)
+	}
+	if identity.EmptyDir == nil {
+		t.Errorf("%s: EmptyDir not set, want a writable emptyDir the sidecar mints into", atunnelIdentityVolume)
+	}
+	if identity.Projected != nil {
+		t.Errorf("%s: Projected is set, want no podCertificate/clusterTrustBundle sources in token-broker mode", atunnelIdentityVolume)
+	}
+
+	for name, wantConfigMapName := range map[string]string{
+		atunnelIdentityCAVolume:  "podidentity.podcert.ate.dev-identity-primary-bundle",
+		atunnelEgressTrustVolume: "servicedns.podcert.ate.dev-identity-primary-bundle",
+	} {
+		v, ok := volumes[name]
+		if !ok {
+			t.Fatalf("volume %q not found", name)
+		}
+		if v.Projected == nil || len(v.Projected.Sources) != 1 || v.Projected.Sources[0].ConfigMap == nil {
+			t.Fatalf("%s: want a single configMap projected source, got %+v", name, v.Projected)
+		}
+		if got := *v.Projected.Sources[0].ConfigMap.Name; got != wantConfigMapName {
+			t.Errorf("%s: ConfigMap name = %q, want %q", name, got, wantConfigMapName)
+		}
+	}
+
+	token, ok := volumes[podcertTokenVolume]
+	if !ok {
+		t.Fatalf("volume %q not found", podcertTokenVolume)
+	}
+	if token.Projected == nil || len(token.Projected.Sources) != 1 || token.Projected.Sources[0].ServiceAccountToken == nil {
+		t.Fatalf("%s: want a single serviceAccountToken projected source, got %+v", podcertTokenVolume, token.Projected)
+	}
+	if got, want := *token.Projected.Sources[0].ServiceAccountToken.Audience, "podcertcontroller.ate.dev"; got != want {
+		t.Errorf("%s: audience = %q, want %q", podcertTokenVolume, got, want)
+	}
+
+	// The ateom container's --atunnel-trust-bundle arg must follow the
+	// trust bundle to its new volume's mount path.
+	args := strings.Join(ps.Containers[0].Args, " ")
+	if !strings.Contains(args, "--atunnel-trust-bundle="+atunnelIdentityCAMountPath+"/trust-bundle.pem") {
+		t.Errorf("ateom container args = %q, want --atunnel-trust-bundle pointed at %s", args, atunnelIdentityCAMountPath)
+	}
+}
+
+// TestTokenBrokerModeAddsSidecar covers the podcert-sidecar-podidentity init
+// container itself: it must run as a native sidecar (restartPolicy: Always,
+// so it mints before the ateom container starts, gated by its startupProbe),
+// dial the configured broker address, and always verify the broker's TLS
+// against the servicedns trust bundle regardless of the purpose it mints --
+// the broker's own listener is always servicedns-purpose (see
+// cmd/podcertcontroller/tokenmint.go).
+func TestTokenBrokerModeAddsSidecar(t *testing.T) {
+	const (
+		brokerAddress = "podcertificate-controller.podcertificate-controller-system.svc:8443"
+		sidecarImage  = "example.com/podcertsidecar:test"
+	)
+	wp := testWorkerPoolApplyConfig(nil)
+	ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}, tokenBrokerSettings{
+		Address:      brokerAddress,
+		SidecarImage: sidecarImage,
+	}).Spec.Template.Spec
+
+	var sidecar *corev1ac.ContainerApplyConfiguration
+	for i := range ps.InitContainers {
+		if *ps.InitContainers[i].Name == "podcert-sidecar-podidentity" {
+			sidecar = &ps.InitContainers[i]
+		}
+	}
+	if sidecar == nil {
+		t.Fatalf("no podcert-sidecar-podidentity init container found; init containers = %+v", ps.InitContainers)
+	}
+	if sidecar.RestartPolicy == nil || *sidecar.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Errorf("RestartPolicy = %v, want Always (a native sidecar)", sidecar.RestartPolicy)
+	}
+	if sidecar.StartupProbe == nil || sidecar.StartupProbe.Exec == nil {
+		t.Fatalf("StartupProbe.Exec not set")
+	}
+	if sidecar.Image == nil || *sidecar.Image != sidecarImage {
+		t.Errorf("Image = %v, want %q (the configured SidecarImage, not a hardcoded ko:// string atecontroller's own binary can never resolve)", sidecar.Image, sidecarImage)
+	}
+
+	args := strings.Join(sidecar.Args, " ")
+	if !strings.Contains(args, "--broker-address="+brokerAddress) {
+		t.Errorf("sidecar args = %q, want --broker-address=%s", args, brokerAddress)
+	}
+	if !strings.Contains(args, "--purpose=podidentity") {
+		t.Errorf("sidecar args = %q, want --purpose=podidentity", args)
+	}
+	if !strings.Contains(args, "--trust-bundle-path="+atunnelEgressTrustMountPath+"/trust-bundle.pem") {
+		t.Errorf("sidecar args = %q, want --trust-bundle-path pointed at the servicedns trust bundle (%s), not the podidentity one", args, atunnelEgressTrustMountPath)
+	}
+}
+
+// TestTokenBrokerModeDisabledByDefault pins tokenBrokerAddress's empty
+// default to today's PodCertificateRequest-based behavior: no sidecar, no
+// emptyDir, no ConfigMap sources.
+func TestTokenBrokerModeDisabledByDefault(t *testing.T) {
+	wp := testWorkerPoolApplyConfig(nil)
+	ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}, tokenBrokerSettings{}).Spec.Template.Spec
+
+	for _, ic := range ps.InitContainers {
+		if *ic.Name == "podcert-sidecar-podidentity" {
+			t.Fatalf("podcert-sidecar-podidentity init container present with tokenBrokerAddress empty, want none")
+		}
+	}
+	for _, v := range ps.Volumes {
+		if *v.Name == podcertTokenVolume {
+			t.Fatalf("volume %q present with tokenBrokerAddress empty, want none", podcertTokenVolume)
+		}
+		if *v.Name == atunnelIdentityVolume && v.EmptyDir != nil {
+			t.Fatalf("%s is an emptyDir with tokenBrokerAddress empty, want the PodCertificateRequest-based projected volume", atunnelIdentityVolume)
+		}
+	}
 }
