@@ -262,6 +262,15 @@ spec:
         - "--ateapi-address=k8s:///api.ate-system.svc:443"
         - "--ateapi-ca-file=/run/servicedns-ca/trust-bundle.pem"
         - "--ateapi-client-cert=/run/podidentity.podcert.ate.dev/credential-bundle.pem"
+        # --upstream-trust-bundle (validating the actor's atunnel ingress server) defaults to
+        # /run/podidentity.podcert.ate.dev/trust-bundle.pem, which only exists when a kubelet-managed
+        # podCertificate volume writes the credential and trust bundle side by side. Here the
+        # podidentity credential (above) and its trust anchor are two separate volumes -- the
+        # credential comes from podcert-sidecar-podidentity's writable emptyDir, the trust anchor
+        # from podcertcontroller's ConfigMap mirror -- so the default resolves to a path that is
+        # never written and Envoy's SDS subscription rejects it as invalid, leaving the router
+        # unable to dial any actor's atunnel server (mTLS upstream never configured).
+        - "--upstream-trust-bundle=/run/podidentity-ca/trust-bundle.pem"
         # Graceful shutdown knobs. --drain-timeout is left at its derived
         # default (park budget + the drain route budget + margin). The sum
         # of the sequence must fit within terminationGracePeriodSeconds above.
