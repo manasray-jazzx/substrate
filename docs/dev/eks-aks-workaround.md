@@ -7,7 +7,7 @@ workaround. It's now implemented: `cmd/podcertcontroller/internal/tokenbroker`,
 `cmd/podcertsidecar`, `internal/identitycert`, and
 `manifests/ate-install/eks-aks/` on this branch. The design held up well
 against the real code — the shape described below is close to what shipped
-— but a handful of details turned out different once built, and four
+— but a handful of details turned out different once built, and five
 separate rounds of live testing against real clusters caught real bugs
 static review missed: two from the first pass against `podcertcontroller`
 alone (see "The sidecar" below), one from actually standing up the bundled
@@ -15,14 +15,22 @@ Postgres (see "seven manifests" below), four more from deploying and
 exercising the *entire* stack end to end — `atecontroller`, worker pods,
 and `atelet`, not just the identity-minting path — for the first time (see
 "Worker pods: a ninth, differently-shaped consumer" and "Three more bugs
-from full-stack live testing" below), and one more (plus a real,
+from full-stack live testing" below), one more (plus a real,
 unresolved architectural gap, not just a bug) from actually running an
 actor through create/resume/suspend/resume once the stack was healthy (see
 "Full-stack verification: an actual actor's lifecycle" and "Remaining
-gaps" below). Every one is called out explicitly rather than silently
-corrected, since the gap between "designed" and "built" — and between "the
-minting path works," "the whole stack comes up," and "an actual workload
-runs on it" — is worth keeping visible.
+gaps" below), and the worst one yet — a cluster-wide, permanent outage
+hiding in plain sight for two days — from leaving the cluster running
+long enough for a fixed-lifetime certificate to actually expire (see
+"The broker's own certificate never refreshed" below). A live,
+real-world consumer of this branch's work — `kagent`, a separate
+CNCF Sandbox project that uses Agent Substrate as its runtime — surfaced
+two more integration gaps of its own the same day (see "kagent: a real
+external consumer" below). Every one is called out explicitly rather
+than silently corrected, since the gap between "designed" and "built" —
+and between "the minting path works," "the whole stack comes up," and
+"an actual workload runs on it, for days, with a real external
+consumer" — is worth keeping visible.
 
 ## The blocker: `PodCertificateRequest` + `ClusterTrustBundle`
 
@@ -533,6 +541,126 @@ cover the demo's own party trick (an HTTP request through `atenet-router`
 incrementing an in-memory counter that survives the round trip) --
 "Remaining gaps" below says why that half was left unverified, deliberately,
 rather than silently.
+
+### The broker's own certificate never refreshed
+
+Two days after the actor-lifecycle verification above, `ate-api-server`
+started failing every Postgres connection with `remote error: tls: expired
+certificate`. Every `podcert-sidecar-*` in the cluster -- Postgres,
+`atelet`, `ate-controller`, every worker pod, `ate-api-server` itself --
+was failing to mint *for the same reason*, continuously, since almost
+exactly 24 hours after `podcertcontroller` had started:
+
+```
+transport: authentication handshake failed: tls: failed to verify certificate:
+x509: certificate has expired or is not yet valid: current time ... is after
+2026-09-24T09:34:32Z
+```
+
+The common thread: every sidecar dials `podcertcontroller`'s
+`PodCertificateBroker` RPC over TLS, verified against the servicedns trust
+bundle. `cmd/podcertcontroller/tokenmint.go`'s `startTokenBroker` minted
+that listener's own serving certificate **once**, at process startup, and
+installed it as a static `tls.Config.Certificates` value -- never
+touched again. Unlike every other certificate in this system (a sidecar
+rewriting a file, or `ate-api-server`'s `credbundle.Loader` re-reading
+one), a certificate served straight from memory needs its own refresh
+loop, and this one never got one. `identitycert.DefaultLifetime` is 24h;
+`podcertcontroller` had been running for exactly that long. The result: a
+cluster-wide, permanent PKI outage, silent until something (here,
+Postgres's own connection errors) surfaced it, recoverable only by
+restarting that one pod -- which resets the clock for another 24h, not a
+fix.
+
+Fixed by giving the broker's own serving certificate the same treatment as
+everything else: a `refreshingBrokerCert` type backing
+`tls.Config.GetCertificate` instead of a static `Certificates` list, with a
+background goroutine that re-mints on the same
+`identitycert.RefreshHeadroom`-before-`NotAfter` schedule
+`cmd/podcertsidecar` already uses. Once redeployed, every consumer's
+already-running retry loop (60s backoff, per `cmd/podcertsidecar`) picked
+up the fix and self-healed within seconds, with no other changes needed —
+proof the *rest* of the refresh architecture (sidecars, backoff, retry) was
+already sound; only this one certificate's source was static instead of
+live.
+
+**Why two rounds of live testing missed this**: every previous verification
+pass, including the actor-lifecycle one above, ran within
+`identitycert.DefaultLifetime` of standing the cluster up. The bug only
+exists in the gap between "works right after deploy" and "still works a
+day later" -- exactly the gap a demo, a CI run, or a quick verification
+pass never crosses, and exactly the gap a real deployment lives in
+permanently. Treat any fresh verification of this branch's PKI bootstrap
+as incomplete until it has run unattended for at least 24h.
+
+### `kagent`: a real external consumer
+
+[kagent](https://github.com/kagent-dev/kagent) is a separate CNCF Sandbox
+project that uses Agent Substrate as its runtime for sandboxed agent
+workloads (see this repo's own `README.md`). Its Helm chart
+(`oci://ghcr.io/kagent-dev/kagent/helm/kagent`, v0.10.2) has a real,
+shipped `controller.substrate.enabled` integration -- not the more
+ambitious future redesign sketched in kagent's own issue #2366, which is
+still unimplemented (`Backlog`) as of this writing, but a working, simpler
+one: the controller dials `ate-api-server` directly and creates
+`ActorTemplate`s that reference an existing `WorkerPool`. Installing it
+against this branch's live cluster (`controller.substrate.ateApiEndpoint`
+pointed at `dns:///api.ate-system.svc:443`, `defaultWorkerPool` pointed at
+the `counter` pool from "Full-stack verification" above,
+`substrate.enabled: false` to skip the chart's own vendored Substrate
+subchart since a proven one was already running) surfaced two more real
+gaps -- in kagent, not in this branch's code, but blocking exactly the
+integration this whole document exists to enable:
+
+1. **kagent v0.10.2's released `substrate.Client`
+   (`pkg/sandboxbackend/substrate/client.go`) has no way to supply a
+   custom trust CA.** Its only TLS knob is a `--substrate-ate-api-insecure`
+   command-line flag (`InsecureSkipVerify: true`), which the Helm chart
+   exposes no way to set (no `args`/`extraArgs` hook on the controller
+   container). Since every Agent Substrate install signs `ate-api-server`'s
+   serving certificate with its own internal CA -- never a public one --
+   `controller.substrate.enabled=true` cannot work out of the box against
+   *any* real Substrate install, self-managed or otherwise; this has
+   nothing to do with the managed-cluster path specifically. The failure
+   mode is misleading: `grpc-go`'s connection state machine treats a TLS
+   handshake failure as `TransientFailure` and keeps retrying silently, so
+   the observable symptom is a generic `context deadline exceeded` after
+   the configured `DialTimeout`, not a certificate error -- confirmed by
+   writing a throwaway reproduction of kagent's exact dial sequence
+   (`grpc.NewClient` + `credentials.NewTLS` + a `GetState()`-polling
+   `waitConnReady`) and watching it fail identically, then succeed the
+   moment `InsecureSkipVerify` was set. **This was diagnosed against the
+   actual v0.10.2 tag, not kagent's `main` branch**: `main`'s
+   `internal/substrate/client.go` has already been refactored past this
+   (it reads `SUBSTRATE_ATE_API_CA_FILE`/`SUBSTRATE_ATE_API_CLIENT_CERT_FILE`
+   env vars into `Config.CAFile`/`ClientCertFile`), but that fix is
+   unreleased -- reading `main` first cost real time diagnosing a
+   TLS-trust problem in a v0.10.2 install that had already been fixed
+   upstream, just not shipped yet. Worked around, for verification only
+   and with explicit sign-off (weakening TLS verification is not something
+   to do silently), by live-patching the Deployment's `args` to add
+   `--substrate-ate-api-insecure`; confirmed this alone was sufficient --
+   the controller reached `1/1 Ready` and its logged config showed
+   `Insecure: true` with no further dial errors.
+2. **kagent's controller also registers a controller-runtime `source.Kind`
+   watch for `ActorTemplate` as a Kubernetes CRD** (alongside its own real
+   CRDs like `AgentHarness`/`SandboxAgent`), logging `"if kind is a CRD, it
+   should be installed before calling Start" ... "no matches for kind
+   \"ActorTemplate\" in version \"ate.dev/v1alpha1\""` on a permanent retry
+   loop. `ActorTemplate` is deliberately **not** a Kubernetes CRD in Agent
+   Substrate (see `demos/counter/README.md`: "the actor template is a
+   Substrate `ActorTemplate` resource ... managed through the ate API,"
+   never a `kubectl apply`-able object) -- this looks like a mismatch
+   between what kagent's controller-runtime scaffolding still assumes and
+   what the real `controller.substrate` integration actually talks to
+   (the gRPC API, per finding 1 above). Non-fatal -- the watch registration
+   fails and retries in the background without blocking startup -- but
+   worth kagent's own attention.
+
+Neither finding is this branch's to fix; both are reported here because
+they were found using this branch's own live cluster and block the exact
+integration this document is building toward. If reporting them upstream,
+kagent-dev/kagent's own issue tracker is the right place, not this repo.
 
 ## Remaining gaps
 
