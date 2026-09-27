@@ -26,11 +26,15 @@ long enough for a fixed-lifetime certificate to actually expire (see
 real-world consumer of this branch's work — `kagent`, a separate
 CNCF Sandbox project that uses Agent Substrate as its runtime — surfaced
 two more integration gaps of its own the same day (see "kagent: a real
-external consumer" below). Every one is called out explicitly rather
-than silently corrected, since the gap between "designed" and "built" —
-and between "the minting path works," "the whole stack comes up," and
-"an actual workload runs on it, for days, with a real external
-consumer" — is worth keeping visible.
+external consumer" below), and a sixth round — patching kagent locally
+against this branch's real API rather than stopping at "not this branch's
+to fix" — found and fixed nine more, real ones, in the process of getting
+an actual chat turn to complete end to end (see "kagent, continued:
+patched locally, proven end-to-end" below). Every one is called out
+explicitly rather than silently corrected, since the gap between
+"designed" and "built" — and between "the minting path works," "the whole
+stack comes up," and "an actual workload runs on it, for days, with a real
+external consumer" — is worth keeping visible.
 
 ## The blocker: `PodCertificateRequest` + `ClusterTrustBundle`
 
@@ -688,6 +692,256 @@ they were found using this branch's own live cluster and block the exact
 integration this document is building toward. If reporting them upstream,
 kagent-dev/kagent's own issue tracker is the right place, not this repo.
 
+### kagent, continued: patched locally, proven end-to-end
+
+The two findings above stalled at "not this branch's to fix." The natural
+next step — actually get a `SandboxAgent` working end to end against this
+branch's real API, to prove the integration is possible at all before
+anyone commits to a real fix (a CRD mirror here, or waiting on kagent's own
+`substrate.Client` redesign) — needed a decision: patch kagent's Go client
+locally and rebuild, or add a compatibility layer to this repo instead. The
+former was chosen, specifically so this stays a disposable proof, never
+upstreamed and never merged into this repo: a local clone of
+`kagent-dev/kagent` at tag `v0.10.2`, patched, rebuilt, redeployed against
+this branch's live cluster. The result lives on a personal fork,
+`manasray-jazzx/kagent`, branch `substrate-agent-substrate-compat` — not
+this repo, and not upstream kagent.
+
+**What had to change in kagent** (all on that branch, none of it upstreamed):
+
+1. **`ActorTemplate` lifecycle rewritten from CRD to the real RPCs.** The
+   whole point of the exercise: `client.Create()`/`Watches()` against
+   `atev1alpha1.ActorTemplate` replaced with
+   `ateapipb.ControlClient.CreateActorTemplate`/`GetActorTemplate`, matching
+   this repo's real API (see "kagent: a real external consumer" above for
+   why the fork's CRD assumption doesn't hold here). Existing templates are
+   immutable and left untouched, matching Substrate's own semantics; a shape
+   change fans out a new template under a new (hash-suffixed) name, tracked
+   via an annotation on the owning `SandboxAgent` rather than listing CRD
+   objects.
+2. **`snapshots_config.storage_location` was dropped in translation** — the
+   RPC conversion never carried the `SandboxAgent`'s
+   `snapshotsConfig.location` field through, and `ate-api-server` rejects an
+   `ActorTemplate` without it (`Required value`). One-line fix once the RPC
+   error surfaced it.
+3. **Proto drift across every call site**: the fork's flat
+   `Actor.Status`/`Actor_STATUS_x` enum is `Actor.Status.State`/
+   `ActorState_ACTOR_STATE_x` here; `Actor.ActorTemplateNamespace`/`Name` is
+   a nested `Actor.ActorTemplate ObjectRef`. Mechanical, but it touches
+   nearly every file in `pkg/sandboxbackend/substrate`.
+4. **`WorkerSelector` assumed a fixed label-key convention that does not
+   exist here.** The fork's own `WorkerPool` controller stamped
+   `kagent.dev/worker-pool: <name>` on every worker pod it managed, so
+   kagent's `ActorTemplate`s were built with `MatchLabels:
+   {"kagent.dev/worker-pool": name}`. This repo's real scheduler
+   (`cmd/ateapi/internal/scheduling`) matches a template's `WorkerSelector`
+   against `ateapipb.Worker.Labels`, and
+   `cmd/atecontroller/internal/workersync/syncer.go`'s
+   `createOrUpdateWorker` sets that field to exactly `pool.GetLabels()` —
+   the `WorkerPool` object's own, admin-defined `metadata.labels` (this
+   cluster's `counter` pool carries `{"workload": "counter"}`, an arbitrary
+   value, not a fixed key at all). Every template kagent built matched zero
+   workers, surfacing as a confusing `no free workers available` even with
+   idle capacity. Fixed by having kagent fetch the real `WorkerPool` object
+   and copy its actual labels instead of assuming a convention.
+5. **A2A routing assumed a DNS-style `Host` header; this repo's
+   `atenet-router` requires a literal header instead.** The fork's router
+   apparently parsed the actor out of a synthesized Host like
+   `<actor-id>.<atespace>.actors.resources.substrate.ate.dev`. This
+   repo's real ingress handler
+   (`cmd/atenet/internal/router/ingress/ingress.go`) only ever reads the
+   `ate-target-actor: <atespace>/<actor>` header
+   (`internal/atenet.ParseTargetActor`) — never `Host` — so every kagent
+   request was rejected with `invalid actor reference` before it ever
+   reached an actor. Fixed by setting that header explicitly in kagent's
+   outbound transport.
+6. **Actor egress was never provisioned, and this repo denies it by
+   default.** A newly created actor has no `EgressPolicy`, and
+   `atenet-egress` logs exactly `egress denied: actor has no egress
+   policy` for one with none — by design, the same default-deny posture
+   `internal/e2e/egresspolicy.go`'s own test helper exists to work around
+   for this repo's *own* tests. kagent never called
+   `CreateActorEgressPolicy` at all, so every outbound call the actor makes
+   — the callback to `kagent-controller` for task-state persistence
+   (`POST /api/tasks`, see the trace below), and any LLM-API call — was
+   silently dropped. Fixed by provisioning an allow-all policy alongside
+   actor creation (a real deployment should scope this to the model
+   backend's hostname plus `kagent-controller` instead).
+7. **`CleanupGeneratedTemplate`/`CleanupSandboxAgentTemplate` were
+   no-ops**, on the incorrect assumption that `CreateActorTemplate` cleans
+   up its own golden actor server-side on delete. It does not: recreating
+   the same `SandboxAgent` three times over the course of testing left
+   three `ActorTemplate`s (and their golden actors) behind forever, one of
+   them stuck mid-resume long enough to hold a real gVisor worker slot
+   indefinitely — directly reducing the `WorkerPool`'s effective capacity
+   under the load test below. Fixed to call the real `DeleteActorTemplate`
+   RPC for every template an agent could have generated across its
+   lifetime (base name, or base name plus every shape-hash suffix).
+   Making cleanup *actually fire* surfaced an eighth bug: `SandboxAgent`
+   `Reconcile` fell through to the generic (non-substrate) reconciler even
+   when the delete path had just finished, recreating the exact template it
+   had just deleted — confirmed live, six milliseconds apart, in
+   `ate-api-server`'s own RPC log — orphaned forever since the
+   `SandboxAgent` it belonged to no longer existed to clean it up again.
+   Fixed by returning immediately once the object is being deleted.
+8. **`reconcileActorTemplate` never returned
+   `ErrActorTemplateReconcilePending`**, the sentinel
+   `SandboxAgentController.Reconcile` needs to requeue every 10s while an
+   `ActorTemplate` isn't ready yet. The fork's version returned it while a
+   spec-drift recreate was mid-flight; this rewrite (RPC-based, no CRD, no
+   recreate step) dropped the only call site that ever produced it — and
+   since a real `ActorTemplate`'s golden actor has no Kubernetes watch to
+   trigger a fresh reconcile when it finishes baking, a `SandboxAgent` that
+   reconciled even once before its golden snapshot was ready never got
+   checked again. Confirmed with a continuous, unwindowed log stream across
+   96+ seconds showing exactly one reconcile attempt total; a
+   `kagent-controller` restart "fixed" it every time, but only because a
+   restart forces one fresh reconcile per object at startup — that was
+   never the real fix. `reconcileActorTemplate` now returns the sentinel
+   whenever `GetGoldenSnapshotStatus().GetGoldenTag()` is nil, whether the
+   template already existed or was just created; a `SandboxAgent` now
+   reaches `Ready` on its own within 1–2 poll cycles.
+9. **`go.mod`'s `replace` directive, once repointed off
+   `kagent-dev/substrate`, pointed at an absolute local filesystem path** —
+   correct for iterating locally, but meaningless to anyone else or to CI.
+   Repointed at the pushed fork commit
+   (`github.com/manasray-jazzx/substrate@5899ac9c`, resolved to a proper Go
+   pseudo-version) before any of this was committed.
+
+**What had to change here, in this repo:** one real bug, already committed
+on this branch — `manifests/ate-install/eks-aks/atenet-router.yaml` never
+overrode `--upstream-trust-bundle`, so it defaulted to
+`/run/podidentity.podcert.ate.dev/trust-bundle.pem`, a path that only
+exists when a kubelet-managed `podCertificate` volume writes the credential
+and its trust anchor side by side. This manifest's `podidentity` credential
+(from `podcert-sidecar-podidentity`'s writable `emptyDir`) and its trust
+anchor (from `podcertcontroller`'s ConfigMap mirror, a separate volume) are
+never colocated, so the default resolved to a path nothing ever writes.
+Envoy's SDS subscription rejected it outright, leaving the router unable to
+dial any actor's `atunnel` ingress server at all — every chat request
+either timed out or came back `503`. Fixed by pointing the flag at
+`/run/podidentity-ca/trust-bundle.pem`, the volume this manifest actually
+populates. (Deploying `atenet-router`, `atenet-egress`, and the
+`actor-id-ca-certs` secret they need — all just cluster-side provisioning,
+none of it a code change — closes the "`atenet-router` was never deployed"
+gap listed below.)
+
+**Separately, an operational finding, not a new bug:**
+`podcertificate-controller`'s own serving-certificate self-refresh loop
+(`cmd/podcertcontroller/tokenmint.go`'s `refreshingBrokerCert.refreshLoop`)
+never fired once across its pod's entire ~24h lifetime, and once that
+certificate expired it wedged *every* consumer's `podcertsidecar` cluster-
+wide simultaneously — `atelet`, both `ate-api-server` replicas — exactly
+the scenario the function's own doc comment already names: "wedges every
+consumer's podcert-sidecar-\* cluster-wide, permanently, until someone
+notices and restarts this one pod... found live... when exactly that
+happened on a cluster that had been up for more than a day." This is the
+same class of incident as "The broker's own certificate never refreshed"
+below, on the *broker's own* cert this time rather than a worker's. Given
+this session's cluster sat idle across real multi-day gaps between testing
+rounds, the leading explanation is a Docker Desktop VM suspend/resume
+clock-skew artifact (a container's internal timers effectively pause along
+with the VM, then wake up to a wall clock that jumped forward without the
+matching elapsed ticks) rather than a reproducible defect in a
+continuously-running cluster — but it is called out here rather than
+silently worked around, the same as everything else in this document.
+Restarting the one pod is the same documented remedy as before, and it
+resolved every downstream symptom immediately, cluster-wide, on the first
+try.
+
+**The proof: a full request lifecycle, real logs, both request shapes.**
+With every fix above deployed, a `SandboxAgent` reaches `Ready: True`
+in ~15-20s from creation, and a chat turn completes end to end. Both
+traces below are from one clean run (`kubectl delete`/`apply` on the
+same minimal `SandboxAgent`, then one session, one message), correlated
+by timestamp across `kagent-controller`, `atenet-router`, `ate-api-server`,
+and the worker pod's `ateom` (gVisor) log.
+
+**Phase 1 — `ActorTemplate` creation and the golden snapshot** (one-time
+per shape; nothing below this repeats for later sessions on the same
+`SandboxAgent`):
+
+```
+13:41:00.719  ate-api-server   GetActorTemplate test-echo-ff8a40cacef0bebb -> NotFound
+13:41:00.722  ate-api-server   CreateActorTemplate test-echo-ff8a40cacef0bebb -> ok
+13:41:16.656  ate-api-server   golden actor 51f37b81... : create -> suspended
+13:41:16.660  ate-api-server   golden actor 51f37b81... : resume -> resuming
+13:41:16.828  ate-api-server   golden actor 51f37b81... : resume -> running   (warms up on a real worker, boots the container)
+13:41:16.833  ate-api-server   golden actor 51f37b81... : suspend -> suspending
+13:41:16.949  ate-api-server   golden actor 51f37b81... : suspend -> suspended  (snapshot taken here)
+13:41:16.969  ate-api-server   golden actor 51f37b81... : delete -> deleting/deleted
+13:41:20.779  kagent-controller  GetActorTemplate test-echo-ff8a40cacef0bebb -> golden_tag set
+13:41:20      SandboxAgent status: Ready=True, reason=WorkloadReady
+```
+
+The golden actor is fully ephemeral: created, run once to take its
+snapshot, then deleted — only the snapshot (referenced by
+`goldenSnapshotStatus.goldenTag`, pointing at the now-gone actor's UID)
+persists. `go run ./cmd/kubectl-ate get actor -a ate-golden` is empty
+immediately after. (Earlier testing rounds in this same document saw
+golden actors retained indefinitely, `SUSPENDED`, never deleted — that
+was fix #7 above not yet being in place, not a difference in this
+delete-on-success behavior.)
+
+**Phase 2 — a chat turn** (`POST /api/sessions`, then one
+`message/send` against `/api/a2a-sandboxes/ate-system/test-echo/`):
+
+```
+13:42:36.498  atenet-router     Request host=asr-...-doc-session-1... -> invalid actor reference   (see note below)
+13:42:36.500  atenet-router     Request (same host) -> ResumeActor -> ACTOR_STATE_RUNNING, workerIP=10.244.0.32
+13:42:36.501  atenet-router     Route ok, targetAddr=10.244.0.32:443
+13:42:36.323  ate-api-server    CreateActor asr-...-doc-session-1 -> suspended        (first turn for this session; later turns skip straight to resume)
+13:42:36.324  ate-api-server    CreateActorEgressPolicy asr-...-doc-session-1         (fix #6 above)
+13:42:36.332  ate-api-server    actor: resume -> resuming
+13:42:36.374  ate-api-server    MintActorCertificate                                 (actor's own atunnel identity)
+13:42:36.370  worker(ateom)     Actor restoring
+13:42:36.419  worker(ateom)     runsc create   (gVisor sandbox)
+13:42:36.423  worker(ateom)     runsc restore -image-path .../restore-state   (from the golden snapshot)
+13:42:36.476  worker(ateom)     Actor restored
+13:42:36.486  ate-api-server    actor: resume -> running
+13:42:36.507  worker(ateom)     Execute        (golang-adk app starts handling the A2A call)
+13:42:36–39   worker(ateom)     ADK session-store lookups (SQLite; first turn, all "record not found", expected)
+13:42:36      kagent-controller POST /api/tasks from 10.244.0.65 (atenet-egress pod)  -> 201   (task-state callback, needs fix #6's egress policy)
+13:42:39.785  worker(ateom)     Tool execution started / failed / completed with error   (model's ask_user call had a harmless schema mismatch; it self-corrected and answered directly)
+13:42:39      kagent-controller more POST/GET /api/tasks -> 200/201  (same callback, repeated per turn step)
+13:42:39.932  ate-api-server    actor: suspend -> suspending
+13:42:39.935  worker(ateom)     Actor checkpointing
+13:42:39.996  worker(ateom)     Actor checkpointed
+13:42:40.033  ate-api-server    actor: suspend -> suspended (FinalizeSuspended)
+13:42:39      kagent-controller Request completed POST /api/a2a-sandboxes/... status=200 duration=3.6s
+```
+
+Client-visible result: a completed A2A task,
+`{"parts":[{"kind":"text","text":"2"}]}`, `status.state: "completed"`.
+
+Two things worth calling out precisely because they look like bugs and
+are not:
+
+- **The first `atenet-router` request in every turn is rejected with
+  `invalid actor reference`, a few hundred microseconds before the real one
+  succeeds.** Confirmed harmless and consistently reproduced — the second
+  request (which carries the `ate-target-actor` header from fix #5) always
+  follows immediately and the turn completes normally. Not chased further;
+  it does not affect correctness or add observable latency.
+- **The actor calling back into `kagent-controller` via `atenet-egress`
+  (`POST /api/tasks`, source IP is the `atenet-egress` pod, not the
+  actor's own) is the golang-adk runtime persisting task/session state as
+  it goes** — this is what fix #6's `EgressPolicy` exists to allow. Without
+  it, this call is silently dropped (`connection reset by peer`), the
+  turn never completes, and the client sees a generic transport error
+  with no indication that egress policy is the cause.
+
+**Under concurrent load, capacity is enforced correctly, not silently
+mishandled.** Five concurrent chat turns against five different sessions,
+with only three physical workers in the pool (two already pinned by
+earlier sessions): one succeeded, four were rejected immediately
+(`~20-60ms`) with `substrate worker pool has no free workers; try again
+later or increase WorkerPool replicas` — `ate-api-server`'s scheduler
+returning `ResourceExhausted`, surfaced by kagent as a clear client-facing
+error rather than a hang. One real gap found this way: kagent's own
+`ErrNoFreeWorkers` message never reaches a server-side log line, only the
+client-facing response body — worth a follow-up, not chased here.
+
 ## Remaining gaps
 
 - **Worker pools outside podcertcontroller's `--trust-bundle-configmap-namespace`
@@ -738,18 +992,14 @@ kagent-dev/kagent's own issue tracker is the right place, not this repo.
   `manifests/ate-install/eks-aks/`'s `kustomize build` output manually, the
   same manual choice the base install already requires for picking an
   egress variant.
-- **`atenet-router` was never deployed in this round of testing.** The actor
-  lifecycle verification below (create/resume/suspend/resume) drives
-  `kubectl ate`'s RPCs directly against `ate-api-server`, which is enough to
-  exercise worker assignment and the snapshot round-trip through object
-  storage, but not the counter demo's actual HTTP-triggered activation path
-  (`atunnel`'s ingress listeners are mTLS-restricted to a specific client
-  identity, almost certainly `atenet-router`'s own, so a plain in-cluster
-  curl can't stand in for it the way the RPC path can). `atenet-router`'s
-  `eks-aks` manifest carries its own two `podcertsidecar` init containers
-  and an Envoy/agentgateway dataplane bootstrap, neither exercised by
-  anything in this document -- treat it as unverified until someone
-  actually deploys it here.
+- ~~**`atenet-router` was never deployed in this round of testing.**~~
+  **Resolved** — see "kagent, continued: patched locally, proven
+  end-to-end" above. Both `atenet-router` and `atenet-egress`'s `eks-aks`
+  manifests are now deployed and exercised end to end by a real
+  HTTP-triggered chat turn (not just the RPC path), including their
+  `podcertsidecar` init containers and Envoy dataplane. One real bug found
+  and fixed in the process (`atenet-router`'s `--upstream-trust-bundle`
+  default), documented there in full.
 - **Reproducing the live cluster this document's testing ran against needs
   state this repo does not track.** Three things were created directly on
   the cluster, not committed anywhere:
