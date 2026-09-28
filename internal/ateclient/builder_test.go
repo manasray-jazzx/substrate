@@ -30,9 +30,13 @@ import (
 	"time"
 
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 func TestInitTracingDisabledReturnsNoProvider(t *testing.T) {
@@ -165,6 +169,50 @@ func TestServerTLSConfig(t *testing.T) {
 	wantPool.AppendCertsFromPEM(servicednsCA2)
 	if !cfg.RootCAs.Equal(wantPool) {
 		t.Error("RootCAs does not match the live servicedns trust bundle")
+	}
+}
+
+// clusterTrustBundleUnavailableReactor makes any List against
+// ClusterTrustBundles fail the way a real apiserver does when
+// certificates.k8s.io/v1beta1 isn't served at all, rather than the fake
+// clientset's default of an empty, successful list.
+func clusterTrustBundleUnavailableReactor(t *testing.T, clientset *fake.Clientset) {
+	t.Helper()
+	clientset.PrependReactor("list", "clustertrustbundles", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: "certificates.k8s.io", Resource: "clustertrustbundles"}, "")
+	})
+}
+
+func TestServerTLSConfigFallsBackToConfigMapWhenClusterTrustBundleUnavailable(t *testing.T) {
+	servicednsCA := testCAPEM(t, "servicedns-ca")
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serviceDNSTrustBundleConfigMapName,
+			Namespace: serviceDNSTrustBundleConfigMapNamespace,
+		},
+		Data: map[string]string{serviceDNSTrustBundleConfigMapDataKey: string(servicednsCA)},
+	}
+	clientset := fake.NewSimpleClientset(cm)
+	clusterTrustBundleUnavailableReactor(t, clientset)
+
+	cfg, err := serverTLSConfig(context.Background(), clientset)
+	if err != nil {
+		t.Fatalf("serverTLSConfig: %v", err)
+	}
+
+	wantPool := x509.NewCertPool()
+	wantPool.AppendCertsFromPEM(servicednsCA)
+	if !cfg.RootCAs.Equal(wantPool) {
+		t.Error("RootCAs does not match the ConfigMap-mirrored trust bundle")
+	}
+}
+
+func TestServerTLSConfigFailsWhenBothSourcesAreUnavailable(t *testing.T) {
+	clientset := fake.NewSimpleClientset()
+	clusterTrustBundleUnavailableReactor(t, clientset)
+
+	if _, err := serverTLSConfig(context.Background(), clientset); err == nil {
+		t.Error("serverTLSConfig: want error when neither ClusterTrustBundle nor its ConfigMap mirror exist, got nil")
 	}
 }
 

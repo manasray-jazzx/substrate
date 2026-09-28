@@ -15,19 +15,13 @@
 package podidentitysigner
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"fmt"
-	"net/url"
-	"path"
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/podcertificate"
 	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/signercontroller"
+	"github.com/agent-substrate/substrate/internal/identitycert"
 	"github.com/agent-substrate/substrate/internal/localca"
 	"github.com/agent-substrate/substrate/internal/substratex509"
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
@@ -60,18 +54,9 @@ func (h *Impl) SignerName() string {
 func (h *Impl) DesiredClusterTrustBundles() ([]*certsv1beta1.ClusterTrustBundle, error) {
 	name := CTBPrefix + "primary-bundle"
 
-	trustAnchors, err := h.caPool.TrustAnchors()
+	trustBundle, err := identitycert.TrustBundlePEM(h.caPool)
 	if err != nil {
-		return nil, fmt.Errorf("while retrieving CA pool trust anchors: %w", err)
-	}
-
-	wantTrustBundle := bytes.Buffer{}
-	for _, anchor := range trustAnchors {
-		block := pem.EncodeToMemory(&pem.Block{
-			Type:  "CERTIFICATE",
-			Bytes: anchor.Raw,
-		})
-		_, _ = wantTrustBundle.Write(block)
+		return nil, err
 	}
 
 	wantCTB := &certsv1beta1.ClusterTrustBundle{
@@ -83,7 +68,7 @@ func (h *Impl) DesiredClusterTrustBundles() ([]*certsv1beta1.ClusterTrustBundle,
 		},
 		Spec: certsv1beta1.ClusterTrustBundleSpec{
 			SignerName:  Name,
-			TrustBundle: wantTrustBundle.String(),
+			TrustBundle: trustBundle,
 		},
 	}
 
@@ -108,43 +93,8 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 		return err
 	}
 
-	lifetime := 24 * time.Hour
 	requestedLifetime := time.Duration(*pcr.Spec.MaxExpirationSeconds) * time.Second
-	if requestedLifetime < lifetime {
-		lifetime = requestedLifetime
-	}
-
-	notBefore := time.Now().Add(-2 * time.Minute)
-	notAfter := notBefore.Add(lifetime)
-	beginRefreshAt := notAfter.Add(-30 * time.Minute)
-
-	spiffeURI := &url.URL{
-		Scheme: "spiffe",
-		Host:   "cluster.local",
-		Path:   path.Join("ns", pcr.ObjectMeta.Namespace, "sa", pcr.Spec.ServiceAccountName),
-	}
-
-	template := &x509.Certificate{
-		// Some golang certificate handling code assumes that if the parent and
-		// template Subject fields compare equal, we are doing a self-signing
-		// operation [1].
-		//
-		// I'm not sure if this is correct, but for defense in depth include
-		// some random content in the subject.
-		//
-		// [1] https://cs.opensource.google/go/go/+/refs/tags/go1.27.0:src/crypto/x509/x509.go;l=1871
-		Subject: pkix.Name{
-			CommonName: rand.Text(),
-		},
-		BasicConstraintsValid: true,
-		NotBefore:             notBefore,
-		NotAfter:              notAfter,
-		URIs:                  []*url.URL{spiffeURI},
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
-		// AuthorityKeyID is automatically set to the SubjectKeyID of the parent
-		// certificate, as long as we are not self-signing a root.
-	}
+	notBefore, notAfter, beginRefreshAt := identitycert.Validity(requestedLifetime)
 
 	// Fields are sourced from the PCR spec (attested by kube-apiserver) rather
 	// than the Pod object, which lacks the ServiceAccount and Node UIDs.
@@ -157,24 +107,14 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 		NodeName:           string(pcr.Spec.NodeName),
 		NodeUID:            string(pcr.Spec.NodeUID),
 	}
-	if err := substratex509.AddPodIdentityToCertificate(podIdentity, template); err != nil {
-		return fmt.Errorf("while adding pod identity to certificate: %w", err)
-	}
-
-	chainDER, err := h.caPool.CreateCertificate(template, subjectPublicKey)
+	template, err := identitycert.PodIdentityTemplate(podIdentity, notBefore, notAfter)
 	if err != nil {
-		return fmt.Errorf("while signing certificate: %w", err)
+		return err
 	}
 
-	chainPEM := &bytes.Buffer{}
-	for _, certDER := range chainDER {
-		err = pem.Encode(chainPEM, &pem.Block{
-			Type:  "CERTIFICATE",
-			Bytes: certDER,
-		})
-		if err != nil {
-			return fmt.Errorf("while encoding certificate to PEM: %w", err)
-		}
+	chainPEM, err := identitycert.SignAndEncode(h.caPool, template, subjectPublicKey)
+	if err != nil {
+		return err
 	}
 
 	pcr = pcr.DeepCopy()
@@ -187,7 +127,7 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 			LastTransitionTime: metav1.NewTime(time.Now()),
 		},
 	}
-	pcr.Status.CertificateChain = chainPEM.String()
+	pcr.Status.CertificateChain = chainPEM
 	pcr.Status.NotBefore = ptr.To(metav1.NewTime(notBefore))
 	pcr.Status.BeginRefreshAt = ptr.To(metav1.NewTime(beginRefreshAt))
 	pcr.Status.NotAfter = ptr.To(metav1.NewTime(notAfter))

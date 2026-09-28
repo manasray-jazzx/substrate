@@ -1,0 +1,77 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package podcertbroker;
+
+option go_package = "github.com/agent-substrate/substrate/internal/proto/podcertbrokerpb";
+
+// PodCertificateBroker mints the same podidentity/servicedns certificates
+// podcertcontroller issues via PodCertificateRequest, for clusters where that
+// Kubernetes API is unavailable (its ClusterTrustBundle/PodCertificateRequest
+// feature gates are not exposed on a managed control plane).
+//
+// Called by a per-pod sidecar in place of the kubelet-managed podCertificate
+// projected volume. Identity is established by TokenReview against a bound
+// ServiceAccount token, not by kubelet/NodeRestriction attestation, so it is
+// a weaker binding than PodCertificateRequest gives: see the caller-identity
+// comment on MintPodCertificateRequest.
+service PodCertificateBroker {
+  rpc MintPodCertificate(MintPodCertificateRequest) returns (MintPodCertificateResponse) {}
+}
+
+// SignerPurpose selects which CA pool signs the certificate and which
+// identity/SAN policy the server applies. The caller cannot influence that
+// policy beyond selecting one of these — see MintPodCertificateRequest.
+enum SignerPurpose {
+  SIGNER_PURPOSE_UNSPECIFIED = 0;
+  // podidentity.podcert.ate.dev/identity: a PodIdentity certificate (see
+  // internal/substratex509), scoped to the caller's own namespace, service
+  // account, pod, and node.
+  SIGNER_PURPOSE_POD_IDENTITY = 1;
+  // servicedns.podcert.ate.dev/identity: a serving certificate whose DNS SANs
+  // are derived from the Services that select the caller's pod.
+  SIGNER_PURPOSE_SERVICE_DNS = 2;
+}
+
+message MintPodCertificateRequest {
+  // Bound ServiceAccount token (JWT) from a projected serviceAccountToken
+  // volume, audience-scoped to this broker. TokenReview against this token is
+  // the caller's authentication; pod_name/pod_uid below are a claim the
+  // server cross-checks against a live Pod lookup (and, when present, the
+  // token's own bound-object claims) rather than trusting outright. This is
+  // strictly weaker than PodCertificateRequest's kubelet/NodeRestriction
+  // attestation: it is API-server-reported identity, not kubelet-attested.
+  string token = 1;
+
+  SignerPurpose purpose = 2;
+
+  // DER-encoded PKCS#10 certificate signing request. Only its public key is
+  // used — any Subject or SAN fields the caller populated are ignored. The
+  // issued certificate's identity is built entirely server-side from
+  // TokenReview plus a Pod (and, for SIGNER_PURPOSE_POD_IDENTITY, Node)
+  // lookup, never from the CSR.
+  bytes certificate_signing_request = 3;
+
+  // The caller's own claim of which pod it is, sourced from the Downward
+  // API. Never trusted on its own — see the token field comment above.
+  string pod_name = 4;
+  string pod_uid = 5;
+}
+
+message MintPodCertificateResponse {
+  // DER-encoded leaf certificate followed by any intermediates, leaf first.
+  repeated bytes certificate_chain = 1;
+}

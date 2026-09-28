@@ -341,6 +341,75 @@ func TestLoaderConcurrentHandshakes(t *testing.T) {
 	wg.Wait()
 }
 
+func TestWriteRoundTripsThroughParse(t *testing.T) {
+	key := generateRSAKey(t)
+	certDER := generateCertificate(t, 9)
+	intermediateDER := generateCertificate(t, 10)
+	path := filepath.Join(t.TempDir(), "bundle.pem")
+
+	if err := Write(path, key, [][]byte{certDER, intermediateDER}); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	got, err := Parse(path)
+	if err != nil {
+		t.Fatalf("Parse() after Write() error = %v", err)
+	}
+	if len(got.Certificate) != 2 {
+		t.Fatalf("Parse() certificate chain length = %d, want 2", len(got.Certificate))
+	}
+	if !bytes.Equal(got.Certificate[0], certDER) {
+		t.Fatalf("Parse() leaf certificate does not match what was written")
+	}
+	if !bytes.Equal(got.Certificate[1], intermediateDER) {
+		t.Fatalf("Parse() intermediate certificate does not match what was written")
+	}
+	gotKeyDER, err := x509.MarshalPKCS8PrivateKey(got.PrivateKey)
+	if err != nil {
+		t.Fatalf("marshal parsed private key: %v", err)
+	}
+	wantKeyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal original private key: %v", err)
+	}
+	if !bytes.Equal(gotKeyDER, wantKeyDER) {
+		t.Fatalf("Parse() private key does not match what was written")
+	}
+}
+
+func TestWriteSetsGroupReadableMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bundle.pem")
+
+	if err := Write(path, generateRSAKey(t), [][]byte{generateCertificate(t, 1)}); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if got, want := fi.Mode().Perm(), os.FileMode(0o640); got != want {
+		t.Fatalf("mode = %o, want %o (group-readable, for a consumer sharing a pod-level fsGroup with a different UID than whatever wrote this file)", got, want)
+	}
+}
+
+func TestWriteDoesNotLeaveTempFileBehind(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bundle.pem")
+
+	if err := Write(path, generateRSAKey(t), [][]byte{generateCertificate(t, 1)}); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "bundle.pem" {
+		t.Fatalf("directory entries = %v, want only bundle.pem", entries)
+	}
+}
+
 func generateRSAKey(t *testing.T) *rsa.PrivateKey {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
