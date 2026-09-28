@@ -226,10 +226,10 @@ func dialPortForward(ctx context.Context, kubeconfigPath, k8sContext, tokenFile 
 // serviceDNSTrustBundleConfigMapNamespace/Name/DataKey mirror
 // signercontroller.ensureTrustBundleConfigMap's naming for the servicedns
 // signer's trust bundle ConfigMap mirror -- see
-// docs/dev/eks-aks-workaround.md. Not imported from that package: it lives
+// docs/dev/mks-workaround.md. Not imported from that package: it lives
 // under cmd/podcertcontroller/internal, off-limits to this package by Go's
 // internal-package visibility rules, and every other consumer of this name
-// (e.g. workerpool_apply.go, the eks-aks manifests) already hardcodes it the
+// (e.g. workerpool_apply.go, the mks manifests) already hardcodes it the
 // same way rather than sharing a constant across binaries for one string.
 const (
 	serviceDNSTrustBundleConfigMapNamespace = "ate-system"
@@ -240,9 +240,9 @@ const (
 func serverTLSConfig(ctx context.Context, clientset kubernetes.Interface) (*tls.Config, error) {
 	pool, ctbErr := serviceDNSTrustPoolFromClusterTrustBundle(ctx, clientset)
 	if ctbErr != nil {
-		// ClusterTrustBundle is unavailable on managed clusters (EKS/AKS)
+		// ClusterTrustBundle is unavailable on managed clusters (MKS)
 		// and on any cluster where certificates.k8s.io/v1beta1 isn't served
-		// at all -- see docs/dev/eks-aks-workaround.md. podcertcontroller
+		// at all -- see docs/dev/mks-workaround.md. podcertcontroller
 		// always mirrors the same trust bundle into a ConfigMap alongside
 		// it when that's the case, so fall back to that rather than failing
 		// outright. A genuine publishing problem on a cluster that does

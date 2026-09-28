@@ -94,9 +94,9 @@ const serviceName = "atecontroller"
 
 // clusterTrustBundleV1beta1Available reports whether this cluster's API
 // server serves certificates.k8s.io/v1beta1's ClusterTrustBundle kind. It is
-// absent on managed clusters (EKS/AKS) whose control plane exposes no alpha
+// absent on managed clusters (MKS) whose control plane exposes no alpha
 // feature gates, and on clusters where the API has moved to v1 -- see
-// docs/dev/eks-aks-workaround.md. A capability probe, not a flag: unlike an
+// docs/dev/mks-workaround.md. A capability probe, not a flag: unlike an
 // operator-set flag, it cannot disagree with what the cluster actually
 // serves.
 func clusterTrustBundleV1beta1Available(disc discovery.DiscoveryInterface) bool {

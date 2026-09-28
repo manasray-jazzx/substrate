@@ -848,7 +848,7 @@ func expectedDeploymentApplyConfig(mutatePodSpec func(*corev1ac.PodSpecApplyConf
 // becomes a writable emptyDir a new init container mints into, its trust
 // bundle moves to a separate ConfigMap-sourced volume, and the egress trust
 // volume switches from clusterTrustBundle to configMap -- see
-// docs/dev/eks-aks-workaround.md.
+// docs/dev/mks-workaround.md.
 func TestTokenBrokerModeReplacesPodCertificateRequestVolumes(t *testing.T) {
 	wp := testWorkerPoolApplyConfig(nil)
 	ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}, tokenBrokerSettings{

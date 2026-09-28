@@ -206,7 +206,7 @@ spec:
         args:
         # Unlike the base manifest, this is off: GCP application default
         # credentials assume a GKE node's metadata server, which a managed
-        # non-GCP cluster (EKS/AKS) has no equivalent of. Worker images are
+        # non-GCP cluster (MKS) has no equivalent of. Worker images are
         # expected to come from a registry that does not need it.
         - --gcp-auth-for-image-pulls=false
         - --grpc-server-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem
@@ -258,7 +258,7 @@ spec:
           value: k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.pod.uid=$(POD_UID),k8s.node.name=$(NODE_NAME),service.instance.id=$(POD_UID)
         # Unlike the base manifest, ATE_STORAGE_BACKEND is not set to "gcs"
         # here: GCS application default credentials assume a GKE node's
-        # metadata server, which a managed non-GCP cluster (EKS/AKS) has no
+        # metadata server, which a managed non-GCP cluster (MKS) has no
         # equivalent of, and atelet creates its storage client eagerly at
         # startup (cmd/atelet/main.go), so a bad default would crash-loop it
         # immediately rather than only failing the operations that use it.

@@ -16,7 +16,7 @@
 // ServiceAccount token instead of a PodCertificateRequest, for clusters that
 // do not have that Kubernetes API available (its ClusterTrustBundle /
 // PodCertificateRequest feature gates are not exposed on a managed control
-// plane such as EKS or AKS).
+// plane such as an MKS offering).
 //
 // This is a materially weaker identity binding than PodCertificateRequest's:
 // a PodCertificateRequest's PodName/PodUID/NodeName/NodeUID fields are

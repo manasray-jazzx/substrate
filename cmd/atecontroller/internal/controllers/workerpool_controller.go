@@ -56,7 +56,7 @@ type WorkerPoolReconciler struct {
 	// atunnel certificates via podcertcontroller's PodCertificateBroker RPC
 	// at this address instead of PodCertificateRequest. Empty (the default)
 	// keeps the existing PodCertificateRequest-based volumes. See
-	// docs/dev/eks-aks-workaround.md.
+	// docs/dev/mks-workaround.md.
 	WorkerTokenBrokerAddress string
 	// WorkerTokenBrokerSidecarImage is the podcert-sidecar-podidentity init
 	// container's image reference, used when WorkerTokenBrokerAddress is

@@ -49,7 +49,7 @@ type EgressMITMTrustReconciler struct {
 	// would fail on every call (not a k8errors.IsNotFound case, since the
 	// kind itself is unregistered) and, left in SetupWithManager's Watch,
 	// would repeatedly fail the manager's own startup. See
-	// docs/dev/eks-aks-workaround.md.
+	// docs/dev/mks-workaround.md.
 	SkipClusterTrustBundle bool
 }
 

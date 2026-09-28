@@ -18,7 +18,7 @@ kind: Kustomization
 # For a fully-managed Kubernetes control plane (e.g. AWS EKS, Azure AKS)
 # where the alpha PodCertificateRequest and ClusterTrustBundle APIs are
 # unavailable (their feature gates are not exposed to customers). See
-# docs/dev/eks-aks-workaround.md for why, and cmd/podcertcontroller's
+# docs/dev/mks-workaround.md for why, and cmd/podcertcontroller's
 # tokenbroker package for what replaces them here.
 #
 # Full standalone copies of the base manifests, not a patch on top of
@@ -31,8 +31,8 @@ kind: Kustomization
 # reorders a volume or container in the base manifests.
 #
 # Mirrors ../base/kustomization.yaml's resource set exactly, minus an egress
-# gateway choice: apply eks-aks/atenet-egress.yaml or
-# eks-aks/atenet-egress-with-sdsmint.yaml alongside this, the same
+# gateway choice: apply mks/atenet-egress.yaml or
+# mks/atenet-egress-with-sdsmint.yaml alongside this, the same
 # manual choice the base install already requires.
 #
 # ate-otel-config.yaml is reused unmodified from ../ate-otel-config.yaml --

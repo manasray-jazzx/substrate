@@ -161,7 +161,7 @@ spec:
         # ateom) -- unavailable on this cluster, so worker pods mint through
         # podcertcontroller's broker RPC too. See
         # cmd/atecontroller/internal/controllers/workerpool_apply.go and
-        # docs/dev/eks-aks-workaround.md.
+        # docs/dev/mks-workaround.md.
         - --worker-token-broker-address=podcertificate-controller.podcertificate-controller-system.svc:8443
         # ko resolve only rewrites a ko:// reference when it is a whole
         # scalar value in the YAML tree, not a substring of a larger one --

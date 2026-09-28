@@ -286,8 +286,8 @@ func main() {
 	// Unlike ateFactory above, this factory's only consumer (systemInfoVolumes,
 	// the egress-mitm trust bundle from #823) is best-effort, and the
 	// ClusterTrustBundle API it depends on is unavailable on managed clusters
-	// (EKS/AKS) and on any cluster where it is not feature-gated in -- see
-	// docs/dev/eks-aks-workaround.md. Waiting on it here synchronously would
+	// (MKS) and on any cluster where it is not feature-gated in -- see
+	// docs/dev/mks-workaround.md. Waiting on it here synchronously would
 	// wedge atelet startup before it reaches the AteomSupport socket setup
 	// below, stalling every ateom worker pod on the node indefinitely. The
 	// reflector keeps retrying via Start above; the lister just serves

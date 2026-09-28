@@ -86,7 +86,7 @@ type ateomOTelSettings struct {
 // before this type existed. Address set (host:port of podcertcontroller's
 // PodCertificateBroker RPC) uses the GA-primitives-only path instead, for
 // clusters where PodCertificateRequest is unavailable -- see
-// docs/dev/eks-aks-workaround.md.
+// docs/dev/mks-workaround.md.
 type tokenBrokerSettings struct {
 	// Address is podcertcontroller's PodCertificateBroker RPC address.
 	Address string
@@ -95,7 +95,7 @@ type tokenBrokerSettings struct {
 	// it reaches this controller: unlike a static YAML manifest, this Go
 	// code is never processed by `ko resolve`, so a `ko://` string here
 	// would reach Kubernetes as literal, invalid text. The static
-	// manifests/ate-install/eks-aks/ate-controller.yaml manifest supplies
+	// manifests/ate-install/mks/ate-controller.yaml manifest supplies
 	// this value pre-resolved, via --worker-token-broker-sidecar-image.
 	// Ignored unless Address is set.
 	SidecarImage string
@@ -116,7 +116,7 @@ const (
 	// podidentity trust, per --atunnel-trust-bundle below) needs a separate
 	// volume; atunnelEgressTrustVolume already carries nothing else, so it
 	// keeps its name and mount path and just swaps source. See
-	// manifests/ate-install/eks-aks/ and docs/dev/eks-aks-workaround.md for
+	// manifests/ate-install/mks/ and docs/dev/mks-workaround.md for
 	// the same pattern applied to the six static consumer manifests.
 	atunnelIdentityCAVolume    = "atunnel-identity-ca"
 	atunnelIdentityCAMountPath = "/run/podidentity-ca"
@@ -307,7 +307,7 @@ func applyAtunnelPKIVolumes(podSpecAC *corev1ac.PodSpecApplyConfiguration, conta
 	// Trust bundles come from podcertcontroller's ConfigMap mirrors (see
 	// signercontroller.ensureTrustBundleConfigMap) rather than
 	// ClusterTrustBundle objects. This mirrors
-	// manifests/ate-install/eks-aks/'s pattern exactly, since every worker
+	// manifests/ate-install/mks/'s pattern exactly, since every worker
 	// pod is, functionally, another PodCertificateRequest consumer.
 	podSpecAC.WithVolumes(
 		corev1ac.Volume().

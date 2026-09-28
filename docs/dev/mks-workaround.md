@@ -1,11 +1,11 @@
-# Running Agent Substrate on a fully-managed control plane (EKS/AKS)
+# Running Agent Substrate on a fully-managed control plane (MKS)
 
 ## Status: implemented on this branch, validated against a live cluster
 
 This started as a design note describing a real blocker and sketching a
 workaround. It's now implemented: `cmd/podcertcontroller/internal/tokenbroker`,
 `cmd/podcertsidecar`, `internal/identitycert`, and
-`manifests/ate-install/eks-aks/` on this branch. The design held up well
+`manifests/ate-install/mks/` on this branch. The design held up well
 against the real code — the shape described below is close to what shipped
 — but a handful of details turned out different once built, and five
 separate rounds of live testing against real clusters caught real bugs
@@ -90,13 +90,13 @@ runtimeConfig:
 ```
 
 These are kube-apiserver, kube-controller-manager, and kubelet flags. On a
-self-managed cluster you set them yourself; on EKS/AKS you cannot — the API
+self-managed cluster you set them yourself; on MKS you cannot — the API
 server doesn't even serve the `certificates.k8s.io/v1beta1` resource group
 without `runtimeConfig` set, and that's a server-side flag no customer of
 either managed offering can touch.
 
 **Confirmed live, and the actual failure mode turned out broader than "gate
-off."** Validating this branch's fix (`hack/verify-eks-aks-pki.sh`) against
+off."** Validating this branch's fix (`hack/verify-mks-pki.sh`) against
 a disposable `kind` v1.37.0 cluster found that cluster serves
 `certificates.k8s.io/v1` — **not** `v1beta1` — for both
 `PodCertificateRequest` and `ClusterTrustBundle`, with no feature gate
@@ -105,10 +105,10 @@ needed at all: these APIs have apparently moved toward GA upstream since
 Go code (and the base manifests) are hardcoded to the `v1beta1` client,
 which 404s against a `v1`-only server exactly like it would against a
 server where the alpha gate is simply off. **This means the constraint
-isn't only "will EKS/AKS turn the gate on" — it's "will Substrate's own
+isn't only "will MKS turn the gate on" — it's "will Substrate's own
 client code target whatever API version a given cluster actually serves,"
 which is a real, present gap on any cluster ahead of wherever `v1beta1`
-support gets dropped upstream, independent of what EKS/AKS do.** The
+support gets dropped upstream, independent of what MKS do.** The
 workaround below sidesteps both failure modes identically, since it uses
 neither `PodCertificateRequest` nor `ClusterTrustBundle` at all.
 
@@ -118,7 +118,7 @@ the projected volume never populates, and TLS setup fails at startup.
 
 ## Secondary portability considerations
 
-These are not blockers on their own, but matter for planning an EKS/AKS
+These are not blockers on their own, but matter for planning an MKS
 deployment once the PKI issue above is resolved:
 
 - **Storage backend**: `cmd/ateapi/main.go:378-400` and
@@ -130,7 +130,7 @@ deployment once the PKI issue above is resolved:
   operations, so a bad default just fails those), `atelet` constructs its
   storage client eagerly at startup — see "Three more bugs from full-stack
   live testing" below for the crash this caused and how
-  `manifests/ate-install/eks-aks/atelet.yaml` now leaves the choice to a
+  `manifests/ate-install/mks/atelet.yaml` now leaves the choice to a
   per-deployment ConfigMap/Secret instead of a hardcoded default.
 - **Worker pod capabilities**: `cmd/atecontroller/internal/controllers/workerpool_apply.go`
   adds `NET_ADMIN`, `SYS_ADMIN`, `SYS_CHROOT`, `SYS_PTRACE` to worker pods
@@ -147,7 +147,7 @@ deployment once the PKI issue above is resolved:
   GKE/GCP-specific (Workload Identity annotations, GKE-endpoint assumptions
   for telemetry). This is a convenience-script limitation; the underlying
   `manifests/ate-install/*.yaml` are plain Kubernetes YAML applicable to any
-  cluster. `manifests/ate-install/eks-aks/` follows the same convention —
+  cluster. `manifests/ate-install/mks/` follows the same convention —
   full standalone manifests, not a script — for exactly this reason.
 - **CNI**: no hard dependency found beyond standard `NetworkPolicy`
   enforcement, so AWS VPC CNI (with the Calico add-on for policy
@@ -216,20 +216,20 @@ Not a single "mode" — three independently flag-gated pieces on
    informer before it ever starts publishing trust bundles, so on a cluster
    where the PCR API is unavailable, that informer never syncs and the
    trust-bundle logic silently never runs at all — not merely erroring,
-   never starting. The `eks-aks` overlay sets this to `false`.
+   never starting. The `mks` overlay sets this to `false`.
 2. **`--trust-bundle-configmap-namespace`** (default empty, disabled) makes
    `signercontroller.Controller.RunTrustBundlePublisher` — pulled out of
    `Run`'s informer-gated sequence specifically so it doesn't depend on it —
    also mirror each signer's trust bundle into a `ConfigMap` in that
    namespace, independently of (and never blocked by) the
-   `ClusterTrustBundle` write next to it. The `eks-aks` overlay sets this to
+   `ClusterTrustBundle` write next to it. The `mks` overlay sets this to
    `ate-system`.
 3. **`--token-mint-listen-address`** (default empty, disabled) starts the
    `PodCertificateBroker` gRPC service (`cmd/podcertcontroller/internal/tokenbroker`)
    on a TCP listener. Its own serving certificate is minted directly from
    the already-loaded service-DNS CA pool — `podcertcontroller` holds that
    CA material outright, so there's no bootstrap dependency on anything
-   else. The `eks-aks` overlay sets this and exposes it via a new
+   else. The `mks` overlay sets this and exposes it via a new
    `Service`.
 
 Each of the six consumer manifests gets one `podcertsidecar` init container
@@ -281,7 +281,7 @@ spec dynamically, in Go, at reconcile time, rather than reading it from a
 YAML file. This surfaced only once this branch's own full-stack live testing
 got as far as actually creating a `WorkerPool` and watching its pod, well
 after the six-manifest and Postgres gaps above were already fixed — the
-identity path can look fully solved from `hack/verify-eks-aks-pki.sh` and a
+identity path can look fully solved from `hack/verify-mks-pki.sh` and a
 healthy control plane alone, and still leave every worker pod unable to
 start.
 
@@ -306,7 +306,7 @@ never touched by `ko` at all — it reaches Kubernetes as the literal text
 The fix threads the resolved image reference in from outside instead:
 `tokenBrokerSettings.SidecarImage`, a new `WorkerPoolReconciler` field and
 `--worker-token-broker-sidecar-image` flag, set in
-`manifests/ate-install/eks-aks/ate-controller.yaml` as two separate arg-list
+`manifests/ate-install/mks/ate-controller.yaml` as two separate arg-list
 elements specifically so `ko resolve` — which processes that static
 manifest before `atecontroller` ever runs — rewrites it before
 `atecontroller`'s own (never-`ko`-processed) binary ever sees the value.
@@ -353,7 +353,7 @@ the `ClusterTrustBundle` write's success:
   `controller-gen` (`+kubebuilder:rbac` marker → `manifests/ate-install/generated/role.yaml`,
   never hand-edited).
 
-Confirmed live: `hack/verify-eks-aks-pki.sh` shows `ensureClusterTrustBundle`
+Confirmed live: `hack/verify-mks-pki.sh` shows `ensureClusterTrustBundle`
 failing continuously and harmlessly (`"the server could not find the
 requested resource"`, retried every ~5s+jitter, never blocking) while
 `ensureTrustBundleConfigMap` succeeds every time on the same tick.
@@ -377,7 +377,7 @@ Confirmed by direct reading, not inference:
   1.21. Both EKS (IRSA/Pod Identity) and AKS (Workload Identity) expose the
   equivalent public OIDC issuer for the same underlying feature. `kubectl-ate`
   and `atecontroller` authenticating to `ateapi` need zero changes on
-  EKS/AKS; this half of Substrate's security story was never blocked by the
+  MKS; this half of Substrate's security story was never blocked by the
   alpha APIs. Only the internal service-to-service mTLS bootstrap
   (`podcertcontroller`) is affected.
 - The PKI bootstrap itself required zero Go code changes in any of the six
@@ -446,7 +446,7 @@ not just `podcertcontroller` and the identity-minting path in isolation:
   cluster has no equivalent of. Neither is part of the PKI bootstrap this
   document otherwise covers, but both are eager enough to crash-loop
   `atelet` immediately, the same way the PKI gaps did, so they had to be
-  fixed to get this far. `manifests/ate-install/eks-aks/atelet.yaml` sets
+  fixed to get this far. `manifests/ate-install/mks/atelet.yaml` sets
   `--gcp-auth-for-image-pulls=false` and no longer sets `ATE_STORAGE_BACKEND`
   directly; it comes instead from an optional, per-deployment
   `atelet-envvars` ConfigMap / `atelet-secret-envvars` Secret (the same
@@ -460,7 +460,7 @@ not just `podcertcontroller` and the identity-minting path in isolation:
 ### RBAC
 
 A **separate** `ClusterRole`/`ClusterRoleBinding`
-(`podcert-token-broker`, `manifests/ate-install/eks-aks/pod-certificate-controller.yaml`),
+(`podcert-token-broker`, `manifests/ate-install/mks/pod-certificate-controller.yaml`),
 bound to the same `default` ServiceAccount `podcertcontroller` already
 runs as, kept apart from the existing `podcert-ate-dev-signer` role so this
 managed-cluster-only grant stays visibly scoped:
@@ -474,7 +474,7 @@ managed-cluster-only grant stays visibly scoped:
 
 ### Verification
 
-`hack/verify-eks-aks-pki.sh` is the durable, re-runnable form of the live
+`hack/verify-mks-pki.sh` is the durable, re-runnable form of the live
 validation this branch was built against:
 
 1. Creates a disposable `kind` cluster (never touches your current
@@ -483,7 +483,7 @@ validation this branch was built against:
    reproducing the blocker, whatever the underlying cause on a given
    cluster turns out to be.
 3. Builds and loads `podcertcontroller` and `podcertsidecar` via `ko`,
-   deploys the `eks-aks` variant of `pod-certificate-controller.yaml`.
+   deploys the `mks` variant of `pod-certificate-controller.yaml`.
 4. Confirms both trust-bundle `ConfigMap` mirrors get published despite
    `ClusterTrustBundle` failing continuously.
 5. Deploys a throwaway pod that mints a `podidentity` certificate through
@@ -809,7 +809,7 @@ this repo, and not upstream kagent.
    pseudo-version) before any of this was committed.
 
 **What had to change here, in this repo:** one real bug, already committed
-on this branch — `manifests/ate-install/eks-aks/atenet-router.yaml` never
+on this branch — `manifests/ate-install/mks/atenet-router.yaml` never
 overrode `--upstream-trust-bundle`, so it defaulted to
 `/run/podidentity.podcert.ate.dev/trust-bundle.pem`, a path that only
 exists when a kubelet-managed `podCertificate` volume writes the credential
@@ -954,7 +954,7 @@ client-facing response body — worth a follow-up, not chased here.
   `ClusterTrustBundle` it replaces, which is cluster-scoped by design
   specifically so any namespace can reference it without a cross-namespace
   read. `podcertcontroller` only ever publishes its ConfigMap mirror into
-  one namespace (`ate-system` in the `eks-aks` manifests), so this is not a
+  one namespace (`ate-system` in the `mks` manifests), so this is not a
   corner case -- it is the default outcome for any `WorkerPool` outside that
   one namespace, which is most real installs' natural shape (a
   `WorkerPool`/atespace per team or workload, not everything crammed into
@@ -976,7 +976,7 @@ client-facing response body — worth a follow-up, not chased here.
   all wasn't verified empirically — only exercised via unit tests against
   `k8s.io/client-go/kubernetes/fake`, which reflects whatever the test
   constructs, not real apiserver behavior. Confirm this against an actual
-  EKS/AKS cluster (or record that it's absent) before relying on it for
+  MKS cluster (or record that it's absent) before relying on it for
   anything beyond defense-in-depth.
 - **Node-attestation trust tradeoff remains as designed**: API-server-reported
   `NodeName`/`NodeUID`, not kubelet-attested. `internal/authz/model.fga`'s
@@ -986,15 +986,15 @@ client-facing response body — worth a follow-up, not chased here.
 - **Namespace-scoped RBAC for the ConfigMap grant** — see RBAC above — is a
   worthwhile tightening for anyone who can guarantee `ate-system` exists
   before `podcertcontroller`'s RBAC applies.
-- **`atenet-egress.yaml`/`atenet-egress-with-sdsmint.yaml`'s eks-aks variants
+- **`atenet-egress.yaml`/`atenet-egress-with-sdsmint.yaml`'s mks variants
   are not wired into a combined install path** the way `agentgateway-egress/`
   etc. compose with `base/` — apply one of them alongside
-  `manifests/ate-install/eks-aks/`'s `kustomize build` output manually, the
+  `manifests/ate-install/mks/`'s `kustomize build` output manually, the
   same manual choice the base install already requires for picking an
   egress variant.
 - ~~**`atenet-router` was never deployed in this round of testing.**~~
   **Resolved** — see "kagent, continued: patched locally, proven
-  end-to-end" above. Both `atenet-router` and `atenet-egress`'s `eks-aks`
+  end-to-end" above. Both `atenet-router` and `atenet-egress`'s `mks`
   manifests are now deployed and exercised end to end by a real
   HTTP-triggered chat turn (not just the RPC path), including their
   `podcertsidecar` init containers and Envoy dataplane. One real bug found
@@ -1012,15 +1012,15 @@ client-facing response body — worth a follow-up, not chased here.
     created directly with `hack/create-kind-cluster.sh` gets this for free.
   - `atelet-devtest`'s `--localhost-registry-replacement=kind-registry:5000`
     flag (patched onto the live DaemonSet, not committed to
-    `manifests/ate-install/eks-aks/atelet.yaml`): `atelet`'s own image-fetch
+    `manifests/ate-install/mks/atelet.yaml`): `atelet`'s own image-fetch
     client (`internal/imagecache`, independent of containerd/kubelet's own
     pulls) resolves a digest-pinned `localhost:5001/...` reference from
     inside its own pod's network namespace, where "localhost" is the pod
     itself, not the registry container -- this flag rewrites it to the
     cluster-DNS-resolvable name. `manifests/ate-install/kind/atelet/kustomization.yaml`
     already carries the same flag for exactly this reason; it was not added
-    to the `eks-aks` manifest because it is a local-testing artifact with no
-    meaning on a real EKS/AKS cluster, not part of the workaround itself.
+    to the `mks` manifest because it is a local-testing artifact with no
+    meaning on a real MKS cluster, not part of the workaround itself.
   - The `atelet-envvars`/`atelet-secret-envvars` ConfigMap/Secret (see
     "Three more bugs from full-stack live testing" above) that point
     `atelet` at the in-cluster `rustfs` S3-compatible backend instead of

@@ -14,21 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Verifies the managed-cluster (EKS/AKS) PKI bootstrap path end-to-end: that
+# Verifies the managed-cluster (MKS) PKI bootstrap path end-to-end: that
 # podcertcontroller's TokenReview-authenticated PodCertificateBroker RPC and
 # podcertsidecar actually mint a working certificate on a cluster where
 # PodCertificateRequest/ClusterTrustBundle are unavailable, without ever
 # deploying the full ate-system stack (no Postgres, no atelet/ateapi/atenet
 # -- those consumers are unchanged by this feature; see
-# manifests/ate-install/eks-aks/ and docs/dev/eks-aks-workaround.md).
+# manifests/ate-install/mks/ and docs/dev/mks-workaround.md).
 #
 # Creates a dedicated, disposable kind cluster -- never touches whatever
 # cluster your current kubeconfig context points at -- deploys
-# podcertcontroller's eks-aks variant, and mints a podidentity certificate
+# podcertcontroller's mks variant, and mints a podidentity certificate
 # for a throwaway pod via podcertsidecar. Fails loudly if any step doesn't
 # produce what it should.
 #
-# Usage: hack/verify-eks-aks-pki.sh [--keep]
+# Usage: hack/verify-mks-pki.sh [--keep]
 #   --keep  Leave the test cluster running afterwards (default: delete it).
 
 set -o errexit -o nounset -o pipefail
@@ -36,7 +36,7 @@ set -o errexit -o nounset -o pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${ROOT}"
 
-CLUSTER_NAME="substrate-eks-aks-verify"
+CLUSTER_NAME="substrate-mks-verify"
 CONTEXT="kind-${CLUSTER_NAME}"
 KEEP=false
 TEST_POD_MANIFEST=""
@@ -62,7 +62,7 @@ kind create cluster --name "${CLUSTER_NAME}" >/dev/null
 
 echo "Confirming this cluster does not serve certificates.k8s.io/v1beta1 (the API"
 echo "podcertcontroller's PodCertificateRequest-based signers depend on) -- this is"
-echo "what actually reproduces the EKS/AKS blocker, whether the underlying cause on"
+echo "what actually reproduces the MKS blocker, whether the underlying cause on"
 echo "a given cluster is an unset alpha feature gate or, as here, the API having"
 echo "moved to a different version this codebase's v1beta1 client can't reach:"
 if kubectl --context "${CONTEXT}" get --raw /apis/certificates.k8s.io/v1beta1 >/dev/null 2>&1; then
@@ -92,8 +92,8 @@ export KO_DOCKER_REPO=kind.local
 KO_PLATFORM="linux/$(docker version -f "{{.Server.Arch}}")"
 ./hack/run-tool.sh ko build --platform="${KO_PLATFORM}" ./cmd/podcertcontroller ./cmd/podcertsidecar >/dev/null
 
-echo "Deploying podcertcontroller's eks-aks (managed-cluster) variant..."
-./hack/run-tool.sh ko resolve --platform="${KO_PLATFORM}" -f manifests/ate-install/eks-aks/pod-certificate-controller.yaml \
+echo "Deploying podcertcontroller's mks (managed-cluster) variant..."
+./hack/run-tool.sh ko resolve --platform="${KO_PLATFORM}" -f manifests/ate-install/mks/pod-certificate-controller.yaml \
   | kubectl --context "${CONTEXT}" apply -f - >/dev/null
 
 echo "Waiting for podcertcontroller to become ready..."

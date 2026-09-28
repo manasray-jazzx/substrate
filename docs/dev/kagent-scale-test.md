@@ -2,7 +2,7 @@
 
 ## Status: one 66-minute run, complete, findings below
 
-This is a follow-up to `docs/dev/eks-aks-workaround.md`'s "kagent, continued:
+This is a follow-up to `docs/dev/mks-workaround.md`'s "kagent, continued:
 patched locally, proven end-to-end" section, which proved a single
 `SandboxAgent` chat turn works end to end. This document scale-tests that
 same integration: many agents instantiating, serving one turn, and

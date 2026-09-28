@@ -61,7 +61,7 @@ const (
 // identitycert.DefaultLifetime after startup and stays that way until the
 // process restarts, wedging every consumer's podcert-sidecar-* cluster-wide,
 // permanently, until someone notices and restarts this one pod -- found live
-// (see docs/dev/eks-aks-workaround.md) when exactly that happened on a
+// (see docs/dev/mks-workaround.md) when exactly that happened on a
 // cluster that had been up for more than a day.
 //
 // Authentication is caller-side only: a caller has no certificate yet (that
